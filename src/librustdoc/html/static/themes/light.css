@@ -5,15 +5,13 @@ body {
 	color: black;
 }
 
-h1, h2, h3:not(.impl):not(.method):not(.type):not(.tymethod),
-h4:not(.method):not(.type):not(.tymethod) {
+h1, h2, h3, h4 {
 	color: black;
 }
 h1.fqn {
 	border-bottom-color: #D5D5D5;
 }
-h2, h3:not(.impl):not(.method):not(.type):not(.tymethod),
-h4:not(.method):not(.type):not(.tymethod) {
+h2, h3, h4 {
 	border-bottom-color: #DDDDDD;
 }
 
@@ -348,6 +346,10 @@ pre.ignore:hover, .information:hover + pre.ignore {
 	border-color: #999;
 }
 
+.notable-traits-tooltiptext .notable {
+	border-bottom-color: #DDDDDD;
+}
+
 #titles > button:not(.selected) {
 	background-color: #e6e6e6;
 	border-top-color: #e6e6e6;
@@ -435,10 +437,10 @@ kbd {
 	background-color: #f9f9f9;
 }
 
-.search-results td span.alias {
+.search-results .result-name span.alias {
 	color: #000;
 }
-.search-results td span.grey {
+.search-results .result-name span.grey {
 	color: #999;
 }
 

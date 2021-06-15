@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_span::edition::Edition;
@@ -51,9 +51,6 @@ crate struct Context<'tcx> {
     pub(super) render_redirect_pages: bool,
     /// The map used to ensure all generated 'id=' attributes are unique.
     pub(super) id_map: RefCell<IdMap>,
-    /// Tracks section IDs for `Deref` targets so they match in both the main
-    /// body and the sidebar.
-    pub(super) deref_id_map: RefCell<FxHashMap<DefId, String>>,
     /// Shared mutable state.
     ///
     /// Issue for improving the situation: [#82381][]
@@ -74,7 +71,7 @@ crate struct Context<'tcx> {
 
 // `Context` is cloned a lot, so we don't want the size to grow unexpectedly.
 #[cfg(target_arch = "x86_64")]
-rustc_data_structures::static_assert_size!(Context<'_>, 152);
+rustc_data_structures::static_assert_size!(Context<'_>, 112);
 
 /// Shared mutable state used in [`Context`] and elsewhere.
 crate struct SharedContext<'tcx> {
@@ -200,8 +197,15 @@ impl<'tcx> Context<'tcx> {
             )
         };
         let keywords = make_item_keywords(it);
+        let name;
+        let tyname_s = if it.is_crate() {
+            name = format!("{} crate", tyname);
+            name.as_str()
+        } else {
+            tyname.as_str()
+        };
         let page = layout::Page {
-            css_class: tyname.as_str(),
+            css_class: tyname_s,
             root_path: &self.root_path(),
             static_root_path: self.shared.static_root_path.as_deref(),
             title: &title,
@@ -479,7 +483,6 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
             dst,
             render_redirect_pages: false,
             id_map: RefCell::new(id_map),
-            deref_id_map: RefCell::new(FxHashMap::default()),
             shared: Rc::new(scx),
             cache: Rc::new(cache),
         };
@@ -497,7 +500,6 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
             dst: self.dst.clone(),
             render_redirect_pages: self.render_redirect_pages,
             id_map: RefCell::new(IdMap::new()),
-            deref_id_map: RefCell::new(FxHashMap::default()),
             shared: Rc::clone(&self.shared),
             cache: Rc::clone(&self.cache),
         }

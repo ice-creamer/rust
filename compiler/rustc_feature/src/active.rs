@@ -250,6 +250,7 @@ declare_features! (
     (active, f16c_target_feature, "1.36.0", Some(44839), None),
     (active, riscv_target_feature, "1.45.0", Some(44839), None),
     (active, ermsb_target_feature, "1.49.0", Some(44839), None),
+    (active, bpf_target_feature, "1.54.0", Some(44839), None),
 
     // -------------------------------------------------------------------------
     // feature-group-end: actual feature gates (target features)
@@ -370,9 +371,6 @@ declare_features! (
     /// Allows `#[doc(masked)]`.
     (active, doc_masked, "1.21.0", Some(44027), None),
 
-    /// Allows `#[doc(include = "some-file")]`.
-    (active, external_doc, "1.22.0", Some(44732), None),
-
     /// Allows using `crate` as visibility modifier, synonymous with `pub(crate)`.
     (active, crate_visibility_modifier, "1.23.0", Some(53120), None),
 
@@ -471,9 +469,6 @@ declare_features! (
 
     /// Allows explicit discriminants on non-unit enum variants.
     (active, arbitrary_enum_discriminant, "1.37.0", Some(60553), None),
-
-    /// Allows `impl Trait` with multiple unrelated lifetimes.
-    (active, member_constraints, "1.37.0", Some(61997), None),
 
     /// Allows `async || body` closures.
     (active, async_closure, "1.37.0", Some(62290), None),
@@ -667,6 +662,9 @@ declare_features! (
 
     /// Allows unnamed fields of struct and union type
     (active, unnamed_fields, "1.53.0", Some(49804), None),
+
+    /// Allows qualified paths in struct expressions, struct patterns and tuple struct patterns.
+    (active, more_qualified_paths, "1.54.0", Some(80080), None),
 
     // -------------------------------------------------------------------------
     // feature-group-end: actual feature gates

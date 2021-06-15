@@ -233,9 +233,16 @@ enum ResolutionError<'a> {
         /* current */ &'static str,
     ),
     /// Error E0530: `X` bindings cannot shadow `Y`s.
-    BindingShadowsSomethingUnacceptable(&'static str, Symbol, &'a NameBinding<'a>),
+    BindingShadowsSomethingUnacceptable {
+        shadowing_binding_descr: &'static str,
+        name: Symbol,
+        participle: &'static str,
+        article: &'static str,
+        shadowed_binding_descr: &'static str,
+        shadowed_binding_span: Span,
+    },
     /// Error E0128: generic parameters with a default cannot use forward-declared identifiers.
-    ForwardDeclaredTyParam, // FIXME(const_generics_defaults)
+    ForwardDeclaredGenericParam,
     /// ERROR E0770: the type of const parameters must not depend on other generic parameters.
     ParamInTyOfConstParam(Symbol),
     /// generic parameters must not be used inside const evaluations.
@@ -902,7 +909,7 @@ pub struct Resolver<'a> {
     /// `CrateNum` resolutions of `extern crate` items.
     extern_crate_map: FxHashMap<LocalDefId, CrateNum>,
     export_map: ExportMap<LocalDefId>,
-    trait_map: NodeMap<Vec<TraitCandidate>>,
+    trait_map: Option<NodeMap<Vec<TraitCandidate>>>,
 
     /// A map from nodes to anonymous modules.
     /// Anonymous modules are pseudo-modules that are implicitly created around items
@@ -1131,8 +1138,8 @@ impl ResolverAstLowering for Resolver<'_> {
         self.next_node_id()
     }
 
-    fn trait_map(&self) -> &NodeMap<Vec<TraitCandidate>> {
-        &self.trait_map
+    fn take_trait_map(&mut self) -> NodeMap<Vec<TraitCandidate>> {
+        std::mem::replace(&mut self.trait_map, None).unwrap()
     }
 
     fn opt_local_def_id(&self, node: NodeId) -> Option<LocalDefId> {
@@ -1191,7 +1198,7 @@ impl<'a> Resolver<'a> {
         session: &'a Session,
         krate: &Crate,
         crate_name: &str,
-        metadata_loader: &'a MetadataLoaderDyn,
+        metadata_loader: Box<MetadataLoaderDyn>,
         arenas: &'a ResolverArenas<'a>,
     ) -> Resolver<'a> {
         let root_local_def_id = LocalDefId { local_def_index: CRATE_DEF_INDEX };
@@ -1279,7 +1286,7 @@ impl<'a> Resolver<'a> {
             label_res_map: Default::default(),
             extern_crate_map: Default::default(),
             export_map: FxHashMap::default(),
-            trait_map: Default::default(),
+            trait_map: Some(NodeMap::default()),
             underscore_disambiguator: 0,
             empty_module,
             module_map,
@@ -2601,7 +2608,7 @@ impl<'a> Resolver<'a> {
                 let res_error = if rib_ident.name == kw::SelfUpper {
                     ResolutionError::SelfInTyParamDefault
                 } else {
-                    ResolutionError::ForwardDeclaredTyParam
+                    ResolutionError::ForwardDeclaredGenericParam
                 };
                 self.report_error(span, res_error);
             }

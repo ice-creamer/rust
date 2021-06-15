@@ -184,7 +184,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::{par_iter, MTLock, MTRef, ParallelIterator};
 use rustc_errors::{ErrorReported, FatalError};
 use rustc_hir as hir;
-use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId};
+use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId, LOCAL_CRATE};
 use rustc_hir::itemlikevisit::ItemLikeVisitor;
 use rustc_hir::lang_items::LangItem;
 use rustc_index::bit_set::GrowableBitSet;
@@ -194,6 +194,7 @@ use rustc_middle::mir::mono::{InstantiationMode, MonoItem};
 use rustc_middle::mir::visit::Visitor as MirVisitor;
 use rustc_middle::mir::{self, Local, Location};
 use rustc_middle::ty::adjustment::{CustomCoerceUnsized, PointerCast};
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::subst::{GenericArgKind, InternalSubsts};
 use rustc_middle::ty::{self, GenericParamDefKind, Instance, Ty, TyCtxt, TypeFoldable};
 use rustc_middle::{middle::codegen_fn_attrs::CodegenFnAttrFlags, mir::visit::TyContext};
@@ -342,7 +343,8 @@ fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionMode) -> Vec<MonoItem<
         .collect()
 }
 
-// Collect all monomorphized items reachable from `starting_point`
+/// Collect all monomorphized items reachable from `starting_point`, and emit a note diagnostic if a
+/// post-monorphization error is encountered during a collection step.
 fn collect_items_rec<'tcx>(
     tcx: TyCtxt<'tcx>,
     starting_point: Spanned<MonoItem<'tcx>>,
@@ -358,6 +360,31 @@ fn collect_items_rec<'tcx>(
 
     let mut neighbors = Vec::new();
     let recursion_depth_reset;
+
+    //
+    // Post-monomorphization errors MVP
+    //
+    // We can encounter errors while monomorphizing an item, but we don't have a good way of
+    // showing a complete stack of spans ultimately leading to collecting the erroneous one yet.
+    // (It's also currently unclear exactly which diagnostics and information would be interesting
+    // to report in such cases)
+    //
+    // This leads to suboptimal error reporting: a post-monomorphization error (PME) will be
+    // shown with just a spanned piece of code causing the error, without information on where
+    // it was called from. This is especially obscure if the erroneous mono item is in a
+    // dependency. See for example issue #85155, where, before minimization, a PME happened two
+    // crates downstream from libcore's stdarch, without a way to know which dependency was the
+    // cause.
+    //
+    // If such an error occurs in the current crate, its span will be enough to locate the
+    // source. If the cause is in another crate, the goal here is to quickly locate which mono
+    // item in the current crate is ultimately responsible for causing the error.
+    //
+    // To give at least _some_ context to the user: while collecting mono items, we check the
+    // error count. If it has changed, a PME occurred, and we trigger some diagnostics about the
+    // current step of mono items collection.
+    //
+    let error_count = tcx.sess.diagnostic().err_count();
 
     match starting_point.node {
         MonoItem::Static(def_id) => {
@@ -409,6 +436,20 @@ fn collect_items_rec<'tcx>(
                 span_bug!(item.span, "Mismatch between hir::Item type and MonoItem type")
             }
         }
+    }
+
+    // Check for PMEs and emit a diagnostic if one happened. To try to show relevant edges of the
+    // mono item graph where the PME diagnostics are currently the most problematic (e.g. ones
+    // involving a dependency, and the lack of context is confusing) in this MVP, we focus on
+    // diagnostics on edges crossing a crate boundary: the collected mono items which are not
+    // defined in the local crate.
+    if tcx.sess.diagnostic().err_count() > error_count && starting_point.node.krate() != LOCAL_CRATE
+    {
+        let formatted_item = with_no_trimmed_paths(|| starting_point.node.to_string());
+        tcx.sess.span_note_without_error(
+            starting_point.span,
+            &format!("the above error was encountered while instantiating `{}`", formatted_item),
+        );
     }
 
     record_accesses(tcx, starting_point.node, neighbors.iter().map(|i| &i.node), inlining_map);

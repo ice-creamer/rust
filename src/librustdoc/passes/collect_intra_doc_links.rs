@@ -91,10 +91,10 @@ impl Res {
         }
     }
 
-    fn name(self, tcx: TyCtxt<'_>) -> String {
+    fn name(self, tcx: TyCtxt<'_>) -> Symbol {
         match self {
-            Res::Def(_, id) => tcx.item_name(id).to_string(),
-            Res::Primitive(prim) => prim.as_str().to_string(),
+            Res::Def(_, id) => tcx.item_name(id),
+            Res::Primitive(prim) => prim.as_sym(),
         }
     }
 
@@ -388,7 +388,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                         ty::AssocKind::Const => "associatedconstant",
                         ty::AssocKind::Type => "associatedtype",
                     };
-                    let fragment = format!("{}#{}.{}", prim_ty.as_str(), out, item_name);
+                    let fragment = format!("{}#{}.{}", prim_ty.as_sym(), out, item_name);
                     (Res::Primitive(prim_ty), fragment, Some((kind.as_def_kind(), item.def_id)))
                 })
         })
@@ -481,7 +481,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                             AnchorFailure::RustdocAnchorConflict(res),
                         ));
                     }
-                    return Ok((res, Some(ty.as_str().to_owned())));
+                    return Ok((res, Some(ty.as_sym().to_string())));
                 }
                 _ => return Ok((res, extra_fragment.clone())),
             }
@@ -1148,7 +1148,7 @@ impl LinkCollector<'_, '_> {
                         return None;
                     }
                     res = prim;
-                    fragment = Some(prim.name(self.cx.tcx));
+                    fragment = Some(prim.name(self.cx.tcx).to_string());
                 } else {
                     // `[char]` when a `char` module is in scope
                     let candidates = vec![res, prim];
@@ -1346,7 +1346,7 @@ impl LinkCollector<'_, '_> {
                             let other_ns = if expected_ns == ValueNS { TypeNS } else { ValueNS };
                             // FIXME: really it should be `resolution_failure` that does this, not `resolve_with_disambiguator`
                             // See https://github.com/rust-lang/rust/pull/76955#discussion_r493953382 for a good approach
-                            for &new_ns in &[other_ns, MacroNS] {
+                            for new_ns in [other_ns, MacroNS] {
                                 if let Some(res) =
                                     self.check_full_res(new_ns, path_str, base_node, extra_fragment)
                                 {
@@ -1444,7 +1444,7 @@ impl LinkCollector<'_, '_> {
                     Ok(res) => Some((res, extra_fragment.clone())),
                     Err(mut kind) => {
                         // `resolve_macro` only looks in the macro namespace. Try to give a better error if possible.
-                        for &ns in &[TypeNS, ValueNS] {
+                        for ns in [TypeNS, ValueNS] {
                             if let Some(res) =
                                 self.check_full_res(ns, path_str, base_node, extra_fragment)
                             {
@@ -1558,7 +1558,7 @@ impl Disambiguator {
                 ("()", DefKind::Fn),
                 ("!", DefKind::Macro(MacroKind::Bang)),
             ];
-            for &(suffix, kind) in &suffixes {
+            for (suffix, kind) in suffixes {
                 if let Some(link) = link.strip_suffix(suffix) {
                     // Avoid turning `!` or `()` into an empty string
                     if !link.is_empty() {
@@ -1798,7 +1798,7 @@ fn resolution_failure(
                             break;
                         };
                         name = start;
-                        for &ns in &[TypeNS, ValueNS, MacroNS] {
+                        for ns in [TypeNS, ValueNS, MacroNS] {
                             if let Some(res) =
                                 collector.check_full_res(ns, &start, module_id.into(), &None)
                             {
@@ -1999,8 +1999,11 @@ fn disambiguator_error(
 ) {
     diag_info.link_range = disambiguator_range;
     report_diagnostic(cx.tcx, BROKEN_INTRA_DOC_LINKS, msg, &diag_info, |diag, _sp| {
-        let msg = "see https://doc.rust-lang.org/nightly/rustdoc/linking-to-items-by-name.html#namespaces-and-disambiguators for more info about disambiguators";
-        diag.note(msg);
+        let msg = format!(
+            "see {}/rustdoc/linking-to-items-by-name.html#namespaces-and-disambiguators for more info about disambiguators",
+            crate::DOC_RUST_LANG_ORG_CHANNEL
+        );
+        diag.note(&msg);
     });
 }
 

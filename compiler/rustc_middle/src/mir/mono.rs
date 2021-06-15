@@ -186,6 +186,15 @@ impl<'tcx> MonoItem<'tcx> {
     pub fn codegen_dep_node(&self, tcx: TyCtxt<'tcx>) -> DepNode {
         crate::dep_graph::make_compile_mono_item(tcx, self)
     }
+
+    /// Returns the item's `CrateNum`
+    pub fn krate(&self) -> CrateNum {
+        match self {
+            MonoItem::Fn(ref instance) => instance.def_id().krate,
+            MonoItem::Static(def_id) => def_id.krate,
+            MonoItem::GlobalAsm(..) => LOCAL_CRATE,
+        }
+    }
 }
 
 impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for MonoItem<'tcx> {
@@ -258,6 +267,7 @@ pub enum Visibility {
 }
 
 impl<'tcx> CodegenUnit<'tcx> {
+    #[inline]
     pub fn new(name: Symbol) -> CodegenUnit<'tcx> {
         CodegenUnit { name, items: Default::default(), size_estimate: None, primary: false }
     }
@@ -302,6 +312,7 @@ impl<'tcx> CodegenUnit<'tcx> {
         self.size_estimate = Some(self.items.keys().map(|mi| mi.size_estimate(tcx)).sum());
     }
 
+    #[inline]
     pub fn size_estimate(&self) -> usize {
         // Should only be called if `estimate_size` has previously been called.
         self.size_estimate.expect("estimate_size must be called before getting a size_estimate")

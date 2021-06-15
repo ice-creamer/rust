@@ -921,7 +921,7 @@ impl<T, A: Allocator> Vec<T, A> {
     ///
     /// ```
     /// let mut vec = Vec::with_capacity(10);
-    /// vec.extend([1, 2, 3].iter().cloned());
+    /// vec.extend([1, 2, 3]);
     /// assert_eq!(vec.capacity(), 10);
     /// vec.shrink_to_fit();
     /// assert!(vec.capacity() >= 3);
@@ -950,7 +950,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// ```
     /// #![feature(shrink_to)]
     /// let mut vec = Vec::with_capacity(10);
-    /// vec.extend([1, 2, 3].iter().cloned());
+    /// vec.extend([1, 2, 3]);
     /// assert_eq!(vec.capacity(), 10);
     /// vec.shrink_to(4);
     /// assert!(vec.capacity() >= 4);
@@ -984,7 +984,7 @@ impl<T, A: Allocator> Vec<T, A> {
     ///
     /// ```
     /// let mut vec = Vec::with_capacity(10);
-    /// vec.extend([1, 2, 3].iter().cloned());
+    /// vec.extend([1, 2, 3]);
     ///
     /// assert_eq!(vec.capacity(), 10);
     /// let slice = vec.into_boxed_slice();
@@ -1619,6 +1619,8 @@ impl<T, A: Allocator> Vec<T, A> {
                 let prev_ptr = ptr.add(gap.write.wrapping_sub(1));
 
                 if same_bucket(&mut *read_ptr, &mut *prev_ptr) {
+                    // Increase `gap.read` now since the drop may panic.
+                    gap.read += 1;
                     /* We have found duplicate, drop it in-place */
                     ptr::drop_in_place(read_ptr);
                 } else {
@@ -1631,9 +1633,8 @@ impl<T, A: Allocator> Vec<T, A> {
 
                     /* We have filled that place, so go further */
                     gap.write += 1;
+                    gap.read += 1;
                 }
-
-                gap.read += 1;
             }
 
             /* Technically we could let `gap` clean up with its Drop, but
@@ -2585,7 +2586,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// ```
     /// let mut v = vec![1, 2, 3];
     /// let new = [7, 8];
-    /// let u: Vec<_> = v.splice(..2, new.iter().cloned()).collect();
+    /// let u: Vec<_> = v.splice(..2, new).collect();
     /// assert_eq!(v, &[7, 8, 3]);
     /// assert_eq!(u, &[1, 2]);
     /// ```

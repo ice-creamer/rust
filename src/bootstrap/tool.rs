@@ -217,9 +217,8 @@ impl Step for ToolBuild {
             if tool == "tidy" {
                 tool = "rust-tidy";
             }
-            let cargo_out =
-                builder.cargo_out(compiler, self.mode, target).join(exe(tool, compiler.host));
-            let bin = builder.tools_dir(compiler).join(exe(tool, compiler.host));
+            let cargo_out = builder.cargo_out(compiler, self.mode, target).join(exe(tool, target));
+            let bin = builder.tools_dir(compiler).join(exe(tool, target));
             builder.copy(&cargo_out, &bin);
             Some(bin)
         }
@@ -264,6 +263,7 @@ pub fn prepare_tool_cargo(
     cargo.env("CFG_RELEASE_CHANNEL", &builder.config.channel);
     cargo.env("CFG_VERSION", builder.rust_version());
     cargo.env("CFG_RELEASE_NUM", &builder.version);
+    cargo.env("DOC_RUST_LANG_ORG_CHANNEL", builder.doc_rust_lang_org_channel());
 
     let info = GitInfo::new(builder.config.ignore_git, &dir);
     if let Some(sha) = info.sha() {
