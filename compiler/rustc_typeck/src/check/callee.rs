@@ -17,7 +17,7 @@ use rustc_infer::{
 use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability,
 };
-use rustc_middle::ty::subst::SubstsRef;
+use rustc_middle::ty::subst::{Subst, SubstsRef};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable};
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
@@ -72,7 +72,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         arg_exprs: &'tcx [hir::Expr<'tcx>],
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
-        let original_callee_ty = self.check_expr(callee_expr);
+        let original_callee_ty = match &callee_expr.kind {
+            hir::ExprKind::Path(hir::QPath::Resolved(..) | hir::QPath::TypeRelative(..)) => self
+                .check_expr_with_expectation_and_args(
+                    callee_expr,
+                    Expectation::NoExpectation,
+                    arg_exprs,
+                ),
+            _ => self.check_expr(callee_expr),
+        };
+
         let expr_ty = self.structurally_resolved_type(call_expr.span, original_callee_ty);
 
         let mut autoderef = self.autoderef(callee_expr.span, expr_ty);
@@ -237,12 +246,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if borrow {
                     // Check for &self vs &mut self in the method signature. Since this is either
                     // the Fn or FnMut trait, it should be one of those.
-                    let (region, mutbl) =
-                        if let ty::Ref(r, _, mutbl) = method.sig.inputs()[0].kind() {
-                            (r, mutbl)
-                        } else {
-                            span_bug!(call_expr.span, "input to call/call_mut is not a ref?");
-                        };
+                    let (region, mutbl) = if let ty::Ref(r, _, mutbl) =
+                        method.sig.inputs()[0].kind()
+                    {
+                        (r, mutbl)
+                    } else {
+                        // The `fn`/`fn_mut` lang item is ill-formed, which should have
+                        // caused an error elsewhere.
+                        self.tcx
+                            .sess
+                            .delay_span_bug(call_expr.span, "input to call/call_mut is not a ref?");
+                        return None;
+                    };
 
                     let mutbl = match mutbl {
                         hir::Mutability::Not => AutoBorrowMutability::Not,
@@ -285,7 +300,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let end = callee_span.shrink_to_hi();
             err.multipart_suggestion(
                 "if you meant to create this closure and immediately call it, surround the \
-                closure with parenthesis",
+                closure with parentheses",
                 vec![(start, "(".to_string()), (end, ")".to_string())],
                 Applicability::MaybeIncorrect,
             );
@@ -302,6 +317,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> Ty<'tcx> {
         let (fn_sig, def_id) = match *callee_ty.kind() {
             ty::FnDef(def_id, subst) => {
+                let fn_sig = self.tcx.fn_sig(def_id).subst(self.tcx, subst);
+
                 // Unit testing: function items annotated with
                 // `#[rustc_evaluate_where_clauses]` trigger special output
                 // to let us test the trait evaluation system.
@@ -314,7 +331,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let obligation = Obligation::new(
                             ObligationCause::dummy_with_span(callee_expr.span),
                             self.param_env,
-                            predicate.clone(),
+                            *predicate,
                         );
                         let result = self.infcx.evaluate_obligation(&obligation);
                         self.tcx
@@ -327,7 +344,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .emit();
                     }
                 }
-                (callee_ty.fn_sig(self.tcx), Some(def_id))
+                (fn_sig, Some(def_id))
             }
             ty::FnPtr(sig) => (sig, None),
             ref t => {
@@ -341,6 +358,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
 
+                let callee_ty = self.resolve_vars_if_possible(callee_ty);
                 let mut err = type_error_struct!(
                     self.tcx.sess,
                     callee_expr.span,
@@ -365,7 +383,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         call_expr.span,
                         &format!(
                             "`{}` is a unit variant, you need to write it \
-                                 without the parenthesis",
+                                 without the parentheses",
                             path
                         ),
                         path.to_string(),
@@ -588,10 +606,17 @@ impl<'a, 'tcx> DeferredCallResolution<'tcx> {
                 fcx.write_method_call(self.call_expr.hir_id, method_callee);
             }
             None => {
-                span_bug!(
+                // This can happen if `#![no_core]` is used and the `fn/fn_mut/fn_once`
+                // lang items are not defined (issue #86238).
+                let mut err = fcx.inh.tcx.sess.struct_span_err(
                     self.call_expr.span,
-                    "failed to find an overloaded call trait for closure call"
+                    "failed to find an overloaded call trait for closure call",
                 );
+                err.help(
+                    "make sure the `fn`/`fn_mut`/`fn_once` lang items are defined \
+                     and have associated `call`/`call_mut`/`call_once` functions",
+                );
+                err.emit();
             }
         }
     }

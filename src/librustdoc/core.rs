@@ -1,4 +1,3 @@
-use rustc_ast as ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::{self, Lrc};
 use rustc_driver::abort_on_err;
@@ -17,20 +16,23 @@ use rustc_middle::hir::map::Map;
 use rustc_middle::middle::privacy::AccessLevels;
 use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
 use rustc_resolve as resolve;
+use rustc_resolve::Namespace::TypeNS;
 use rustc_session::config::{self, CrateType, ErrorOutputType};
 use rustc_session::lint;
 use rustc_session::DiagnosticOutput;
 use rustc_session::Session;
+use rustc_span::def_id::CRATE_DEF_INDEX;
 use rustc_span::source_map;
 use rustc_span::symbol::sym;
-use rustc_span::Span;
+use rustc_span::{Span, DUMMY_SP};
 
 use std::cell::RefCell;
+use std::lazy::SyncLazy;
 use std::mem;
 use std::rc::Rc;
 
 use crate::clean::inline::build_external_trait;
-use crate::clean::{self, FakeDefId, TraitWithExtraInfo};
+use crate::clean::{self, ItemId, TraitWithExtraInfo};
 use crate::config::{Options as RustdocOptions, OutputFormat, RenderOptions};
 use crate::formats::cache::Cache;
 use crate::passes::{self, Condition::*, ConditionalPass};
@@ -54,14 +56,10 @@ crate struct DocContext<'tcx> {
     /// Used while populating `external_traits` to ensure we don't process the same trait twice at
     /// the same time.
     crate active_extern_traits: FxHashSet<DefId>,
-    // The current set of type and lifetime substitutions,
+    // The current set of parameter substitutions,
     // for expanding type aliases at the HIR level:
-    /// Table `DefId` of type parameter -> substituted type
-    crate ty_substs: FxHashMap<DefId, clean::Type>,
-    /// Table `DefId` of lifetime parameter -> substituted lifetime
-    crate lt_substs: FxHashMap<DefId, clean::Lifetime>,
-    /// Table `DefId` of const parameter -> substituted const
-    crate ct_substs: FxHashMap<DefId, clean::Constant>,
+    /// Table `DefId` of type, lifetime, or const parameter -> substituted type, lifetime, or const
+    crate substs: FxHashMap<DefId, clean::SubstParam>,
     /// Table synthetic type parameter for `impl Trait` in argument position -> bounds
     crate impl_trait_bounds: FxHashMap<ImplTraitParam, Vec<clean::GenericBound>>,
     /// Auto-trait or blanket impls processed so far, as `(self_ty, trait_def_id)`.
@@ -78,14 +76,14 @@ crate struct DocContext<'tcx> {
     /// This same cache is used throughout rustdoc, including in [`crate::html::render`].
     crate cache: Cache,
     /// Used by [`clean::inline`] to tell if an item has already been inlined.
-    crate inlined: FxHashSet<FakeDefId>,
+    crate inlined: FxHashSet<ItemId>,
     /// Used by `calculate_doc_coverage`.
     crate output_format: OutputFormat,
 }
 
 impl<'tcx> DocContext<'tcx> {
     crate fn sess(&self) -> &'tcx Session {
-        &self.tcx.sess
+        self.tcx.sess
     }
 
     crate fn with_param_env<T, F: FnOnce(&mut Self) -> T>(&mut self, def_id: DefId, f: F) -> T {
@@ -104,36 +102,25 @@ impl<'tcx> DocContext<'tcx> {
 
     /// Call the closure with the given parameters set as
     /// the substitutions for a type alias' RHS.
-    crate fn enter_alias<F, R>(
-        &mut self,
-        ty_substs: FxHashMap<DefId, clean::Type>,
-        lt_substs: FxHashMap<DefId, clean::Lifetime>,
-        ct_substs: FxHashMap<DefId, clean::Constant>,
-        f: F,
-    ) -> R
+    crate fn enter_alias<F, R>(&mut self, substs: FxHashMap<DefId, clean::SubstParam>, f: F) -> R
     where
         F: FnOnce(&mut Self) -> R,
     {
-        let (old_tys, old_lts, old_cts) = (
-            mem::replace(&mut self.ty_substs, ty_substs),
-            mem::replace(&mut self.lt_substs, lt_substs),
-            mem::replace(&mut self.ct_substs, ct_substs),
-        );
+        let old_substs = mem::replace(&mut self.substs, substs);
         let r = f(self);
-        self.ty_substs = old_tys;
-        self.lt_substs = old_lts;
-        self.ct_substs = old_cts;
+        self.substs = old_substs;
         r
     }
 
     /// Like `hir().local_def_id_to_hir_id()`, but skips calling it on fake DefIds.
     /// (This avoids a slice-index-out-of-bounds panic.)
-    crate fn as_local_hir_id(tcx: TyCtxt<'_>, def_id: FakeDefId) -> Option<HirId> {
+    crate fn as_local_hir_id(tcx: TyCtxt<'_>, def_id: ItemId) -> Option<HirId> {
         match def_id {
-            FakeDefId::Real(real_id) => {
+            ItemId::DefId(real_id) => {
                 real_id.as_local().map(|def_id| tcx.hir().local_def_id_to_hir_id(def_id))
             }
-            FakeDefId::Fake(_, _) => None,
+            // FIXME: Can this be `Some` for `Auto` or `Blanket`?
+            _ => None,
         }
     }
 }
@@ -204,7 +191,6 @@ crate fn create_config(
         lint_opts,
         describe_lints,
         lint_cap,
-        display_warnings,
         ..
     }: RustdocOptions,
 ) -> rustc_interface::Config {
@@ -237,7 +223,7 @@ crate fn create_config(
         maybe_sysroot,
         search_paths: libs,
         crate_types,
-        lint_opts: if !display_warnings { lint_opts } else { vec![] },
+        lint_opts,
         lint_cap,
         cg: codegen_options,
         externs,
@@ -272,9 +258,8 @@ crate fn create_config(
             providers.typeck_item_bodies = |_, _| {};
             // hack so that `used_trait_imports` won't try to call typeck
             providers.used_trait_imports = |_, _| {
-                lazy_static! {
-                    static ref EMPTY_SET: FxHashSet<LocalDefId> = FxHashSet::default();
-                }
+                static EMPTY_SET: SyncLazy<FxHashSet<LocalDefId>> =
+                    SyncLazy::new(FxHashSet::default);
                 &EMPTY_SET
             };
             // In case typeck does end up being called, don't ICE in case there were name resolution errors
@@ -282,9 +267,9 @@ crate fn create_config(
                 // Closures' tables come from their outermost function,
                 // as they are part of the same "inference environment".
                 // This avoids emitting errors for the parent twice (see similar code in `typeck_with_fallback`)
-                let outer_def_id = tcx.closure_base_def_id(def_id.to_def_id()).expect_local();
-                if outer_def_id != def_id {
-                    return tcx.typeck(outer_def_id);
+                let typeck_root_def_id = tcx.typeck_root_def_id(def_id.to_def_id()).expect_local();
+                if typeck_root_def_id != def_id {
+                    return tcx.typeck(typeck_root_def_id);
                 }
 
                 let hir = tcx.hir();
@@ -300,17 +285,43 @@ crate fn create_config(
 }
 
 crate fn create_resolver<'a>(
+    externs: config::Externs,
     queries: &Queries<'a>,
     sess: &Session,
 ) -> Rc<RefCell<interface::BoxedResolver>> {
-    let parts = abort_on_err(queries.expansion(), sess).peek();
-    let (krate, resolver, _) = &*parts;
-    let resolver = resolver.borrow().clone();
+    let (krate, resolver, _) = &*abort_on_err(queries.expansion(), sess).peek();
+    let resolver = resolver.clone();
 
-    let mut loader = crate::passes::collect_intra_doc_links::IntraLinkCrateLoader::new(resolver);
-    ast::visit::walk_crate(&mut loader, krate);
+    let resolver = crate::passes::collect_intra_doc_links::load_intra_link_crates(resolver, krate);
 
-    loader.resolver
+    // FIXME: somehow rustdoc is still missing crates even though we loaded all
+    // the known necessary crates. Load them all unconditionally until we find a way to fix this.
+    // DO NOT REMOVE THIS without first testing on the reproducer in
+    // https://github.com/jyn514/objr/commit/edcee7b8124abf0e4c63873e8422ff81beb11ebb
+    let extern_names: Vec<String> = externs
+        .iter()
+        .filter(|(_, entry)| entry.add_prelude)
+        .map(|(name, _)| name)
+        .cloned()
+        .collect();
+    resolver.borrow_mut().access(|resolver| {
+        sess.time("load_extern_crates", || {
+            for extern_name in &extern_names {
+                debug!("loading extern crate {}", extern_name);
+                if let Err(()) = resolver
+                    .resolve_str_path_error(
+                        DUMMY_SP,
+                        extern_name,
+                        TypeNS,
+                        LocalDefId { local_def_index: CRATE_DEF_INDEX }.to_def_id(),
+                  ) {
+                    warn!("unable to resolve external crate {} (do you have an unused `--extern` crate?)", extern_name)
+                  }
+            }
+        });
+    });
+
+    resolver
 }
 
 crate fn run_global_ctxt(
@@ -334,30 +345,19 @@ crate fn run_global_ctxt(
 
     // NOTE: This is copy/pasted from typeck/lib.rs and should be kept in sync with those changes.
     tcx.sess.time("item_types_checking", || {
-        for &module in tcx.hir().krate().modules.keys() {
-            tcx.ensure().check_mod_item_types(module);
-        }
+        tcx.hir().for_each_module(|module| tcx.ensure().check_mod_item_types(module))
     });
     tcx.sess.abort_if_errors();
     tcx.sess.time("missing_docs", || {
         rustc_lint::check_crate(tcx, rustc_lint::builtin::MissingDoc::new);
     });
     tcx.sess.time("check_mod_attrs", || {
-        for &module in tcx.hir().krate().modules.keys() {
-            tcx.ensure().check_mod_attrs(module);
-        }
+        tcx.hir().for_each_module(|module| tcx.ensure().check_mod_attrs(module))
     });
     rustc_passes::stability::check_unused_or_stable_features(tcx);
 
-    let access_levels = tcx.privacy_access_levels(());
-    // Convert from a HirId set to a DefId set since we don't always have easy access
-    // to the map from defid -> hirid
     let access_levels = AccessLevels {
-        map: access_levels
-            .map
-            .iter()
-            .map(|(&k, &v)| (tcx.hir().local_def_id(k).to_def_id(), v))
-            .collect(),
+        map: tcx.privacy_access_levels(()).map.iter().map(|(k, v)| (k.to_def_id(), *v)).collect(),
     };
 
     let mut ctxt = DocContext {
@@ -366,9 +366,7 @@ crate fn run_global_ctxt(
         param_env: ParamEnv::empty(),
         external_traits: Default::default(),
         active_extern_traits: Default::default(),
-        ty_substs: Default::default(),
-        lt_substs: Default::default(),
-        ct_substs: Default::default(),
+        substs: Default::default(),
         impl_trait_bounds: Default::default(),
         generated_synthetics: Default::default(),
         auto_traits: tcx
@@ -480,7 +478,7 @@ crate fn run_global_ctxt(
                 _ => continue,
             };
             for name in value.as_str().split_whitespace() {
-                let span = attr.name_value_literal_span().unwrap_or(attr.span());
+                let span = attr.name_value_literal_span().unwrap_or_else(|| attr.span());
                 manual_passes.extend(parse_pass(name, Some(span)));
             }
         }
@@ -502,17 +500,17 @@ crate fn run_global_ctxt(
         };
         if run {
             debug!("running pass {}", p.pass.name);
-            krate = ctxt.tcx.sess.time(p.pass.name, || (p.pass.run)(krate, &mut ctxt));
+            krate = tcx.sess.time(p.pass.name, || (p.pass.run)(krate, &mut ctxt));
         }
     }
 
-    ctxt.sess().abort_if_errors();
+    if tcx.sess.diagnostic().has_errors_or_lint_errors() {
+        rustc_errors::FatalError.raise();
+    }
 
     let render_options = ctxt.render_options;
     let mut cache = ctxt.cache;
-    krate = tcx.sess.time("create_format_cache", || {
-        cache.populate(krate, tcx, &render_options.extern_html_root_urls, &render_options.output)
-    });
+    krate = tcx.sess.time("create_format_cache", || cache.populate(krate, tcx, &render_options));
 
     // The main crate doc comments are always collapsed.
     krate.collapsed = true;

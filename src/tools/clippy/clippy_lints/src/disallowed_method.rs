@@ -1,41 +1,44 @@
-use clippy_utils::diagnostics::span_lint;
+use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::fn_def_id;
 
-use rustc_data_structures::fx::FxHashSet;
-use rustc_hir::Expr;
+use rustc_hir::{def::Res, def_id::DefIdMap, Expr};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::Symbol;
+
+use crate::utils::conf;
 
 declare_clippy_lint! {
-    /// **What it does:** Denies the configured methods and functions in clippy.toml
+    /// ### What it does
+    /// Denies the configured methods and functions in clippy.toml
     ///
-    /// **Why is this bad?** Some methods are undesirable in certain contexts,
-    /// and it's beneficial to lint for them as needed.
+    /// ### Why is this bad?
+    /// Some methods are undesirable in certain contexts, and it's beneficial to
+    /// lint for them as needed.
     ///
-    /// **Known problems:** Currently, you must write each function as a
-    /// fully-qualified path. This lint doesn't support aliases or reexported
-    /// names; be aware that many types in `std` are actually reexports.
-    ///
-    /// For example, if you want to disallow `Duration::as_secs`, your clippy.toml
-    /// configuration would look like
-    /// `disallowed-methods = ["core::time::Duration::as_secs"]` and not
-    /// `disallowed-methods = ["std::time::Duration::as_secs"]` as you might expect.
-    ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// An example clippy.toml configuration:
     /// ```toml
     /// # clippy.toml
-    /// disallowed-methods = ["alloc::vec::Vec::leak", "std::time::Instant::now"]
+    /// disallowed-methods = [
+    ///     # Can use a string as the path of the disallowed method.
+    ///     "std::boxed::Box::new",
+    ///     # Can also use an inline table with a `path` key.
+    ///     { path = "std::time::Instant::now" },
+    ///     # When using an inline table, can add a `reason` for why the method
+    ///     # is disallowed.
+    ///     { path = "std::vec::Vec::leak", reason = "no leaking memory" },
+    /// ]
     /// ```
     ///
     /// ```rust,ignore
     /// // Example code where clippy issues a warning
     /// let xs = vec![1, 2, 3, 4];
     /// xs.leak(); // Vec::leak is disallowed in the config.
+    /// // The diagnostic contains the message "no leaking memory".
     ///
     /// let _now = Instant::now(); // Instant::now is disallowed in the config.
+    ///
+    /// let _box = Box::new(3); // Box::new is disallowed in the config.
     /// ```
     ///
     /// Use instead:
@@ -51,16 +54,15 @@ declare_clippy_lint! {
 
 #[derive(Clone, Debug)]
 pub struct DisallowedMethod {
-    disallowed: FxHashSet<Vec<Symbol>>,
+    conf_disallowed: Vec<conf::DisallowedMethod>,
+    disallowed: DefIdMap<Option<String>>,
 }
 
 impl DisallowedMethod {
-    pub fn new(disallowed: &FxHashSet<String>) -> Self {
+    pub fn new(conf_disallowed: Vec<conf::DisallowedMethod>) -> Self {
         Self {
-            disallowed: disallowed
-                .iter()
-                .map(|s| s.split("::").map(|seg| Symbol::intern(seg)).collect::<Vec<_>>())
-                .collect(),
+            conf_disallowed,
+            disallowed: DefIdMap::default(),
         }
     }
 }
@@ -68,23 +70,37 @@ impl DisallowedMethod {
 impl_lint_pass!(DisallowedMethod => [DISALLOWED_METHOD]);
 
 impl<'tcx> LateLintPass<'tcx> for DisallowedMethod {
-    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        if let Some(def_id) = fn_def_id(cx, expr) {
-            let func_path = cx.get_def_path(def_id);
-            if self.disallowed.contains(&func_path) {
-                let func_path_string = func_path
-                    .into_iter()
-                    .map(Symbol::to_ident_string)
-                    .collect::<Vec<_>>()
-                    .join("::");
-
-                span_lint(
-                    cx,
-                    DISALLOWED_METHOD,
-                    expr.span,
-                    &format!("use of a disallowed method `{}`", func_path_string),
-                );
+    fn check_crate(&mut self, cx: &LateContext<'_>) {
+        for conf in &self.conf_disallowed {
+            let (path, reason) = match conf {
+                conf::DisallowedMethod::Simple(path) => (path, None),
+                conf::DisallowedMethod::WithReason { path, reason } => (
+                    path,
+                    reason.as_ref().map(|reason| format!("{} (from clippy.toml)", reason)),
+                ),
+            };
+            let segs: Vec<_> = path.split("::").collect();
+            if let Res::Def(_, id) = clippy_utils::path_to_res(cx, &segs) {
+                self.disallowed.insert(id, reason);
             }
         }
+    }
+
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
+        let def_id = match fn_def_id(cx, expr) {
+            Some(def_id) => def_id,
+            None => return,
+        };
+        let reason = match self.disallowed.get(&def_id) {
+            Some(reason) => reason,
+            None => return,
+        };
+        let func_path = cx.tcx.def_path_str(def_id);
+        let msg = format!("use of a disallowed method `{}`", func_path);
+        span_lint_and_then(cx, DISALLOWED_METHOD, expr.span, &msg, |diag| {
+            if let Some(reason) = reason {
+                diag.note(reason);
+            }
+        });
     }
 }

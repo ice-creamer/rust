@@ -1,6 +1,6 @@
 // run-rustfix
 
-#![allow(clippy::print_literal, clippy::redundant_clone)]
+#![allow(clippy::print_literal, clippy::redundant_clone, clippy::to_string_in_format_args)]
 #![warn(clippy::useless_format)]
 
 struct Foo(pub String);
@@ -17,6 +17,8 @@ fn main() {
         r##"foo {{}}
 " bar"##
     );
+
+    let _ = format!("");
 
     format!("{}", "foo");
     format!("{:?}", "foo"); // Don't warn about `Debug`.
@@ -71,4 +73,6 @@ fn main() {
     // Wrap it with braces
     let v: Vec<String> = vec!["foo".to_string(), "bar".to_string()];
     let _s: String = format!("{}", &*v.join("\n"));
+
+    format!("prepend {:+}", "s");
 }

@@ -16,10 +16,8 @@ use crate::MemFlags;
 use rustc_middle::ty::layout::{HasParamEnv, TyAndLayout};
 use rustc_middle::ty::Ty;
 use rustc_span::Span;
-use rustc_target::abi::{Abi, Align, Scalar, Size};
+use rustc_target::abi::{Abi, Align, Scalar, Size, WrappingRange};
 use rustc_target::spec::HasTargetSpec;
-
-use std::ops::Range;
 
 #[derive(Copy, Clone)]
 pub enum OverflowOp {
@@ -72,6 +70,7 @@ pub trait BuilderMethods<'a, 'tcx>:
     );
     fn invoke(
         &mut self,
+        llty: Self::Type,
         llfn: Self::Value,
         args: &[Self::Value],
         then: Self::BasicBlock,
@@ -125,21 +124,27 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn from_immediate(&mut self, val: Self::Value) -> Self::Value;
     fn to_immediate(&mut self, val: Self::Value, layout: TyAndLayout<'_>) -> Self::Value {
-        if let Abi::Scalar(ref scalar) = layout.abi {
+        if let Abi::Scalar(scalar) = layout.abi {
             self.to_immediate_scalar(val, scalar)
         } else {
             val
         }
     }
-    fn to_immediate_scalar(&mut self, val: Self::Value, scalar: &Scalar) -> Self::Value;
+    fn to_immediate_scalar(&mut self, val: Self::Value, scalar: Scalar) -> Self::Value;
 
     fn alloca(&mut self, ty: Self::Type, align: Align) -> Self::Value;
     fn dynamic_alloca(&mut self, ty: Self::Type, align: Align) -> Self::Value;
     fn array_alloca(&mut self, ty: Self::Type, len: Self::Value, align: Align) -> Self::Value;
 
-    fn load(&mut self, ptr: Self::Value, align: Align) -> Self::Value;
-    fn volatile_load(&mut self, ptr: Self::Value) -> Self::Value;
-    fn atomic_load(&mut self, ptr: Self::Value, order: AtomicOrdering, size: Size) -> Self::Value;
+    fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: Align) -> Self::Value;
+    fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value) -> Self::Value;
+    fn atomic_load(
+        &mut self,
+        ty: Self::Type,
+        ptr: Self::Value,
+        order: AtomicOrdering,
+        size: Size,
+    ) -> Self::Value;
     fn load_operand(&mut self, place: PlaceRef<'tcx, Self::Value>)
     -> OperandRef<'tcx, Self::Value>;
 
@@ -151,8 +156,10 @@ pub trait BuilderMethods<'a, 'tcx>:
         dest: PlaceRef<'tcx, Self::Value>,
     ) -> Self;
 
-    fn range_metadata(&mut self, load: Self::Value, range: Range<u128>);
+    fn range_metadata(&mut self, load: Self::Value, range: WrappingRange);
     fn nonnull_metadata(&mut self, load: Self::Value);
+    fn type_metadata(&mut self, function: Self::Function, typeid: String);
+    fn typeid_metadata(&mut self, typeid: String) -> Self::Value;
 
     fn store(&mut self, val: Self::Value, ptr: Self::Value, align: Align) -> Self::Value;
     fn store_with_flags(
@@ -170,9 +177,14 @@ pub trait BuilderMethods<'a, 'tcx>:
         size: Size,
     );
 
-    fn gep(&mut self, ptr: Self::Value, indices: &[Self::Value]) -> Self::Value;
-    fn inbounds_gep(&mut self, ptr: Self::Value, indices: &[Self::Value]) -> Self::Value;
-    fn struct_gep(&mut self, ptr: Self::Value, idx: u64) -> Self::Value;
+    fn gep(&mut self, ty: Self::Type, ptr: Self::Value, indices: &[Self::Value]) -> Self::Value;
+    fn inbounds_gep(
+        &mut self,
+        ty: Self::Type,
+        ptr: Self::Value,
+        indices: &[Self::Value],
+    ) -> Self::Value;
+    fn struct_gep(&mut self, ty: Self::Type, ptr: Self::Value, idx: u64) -> Self::Value;
 
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
     fn sext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
@@ -292,6 +304,7 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn call(
         &mut self,
+        llty: Self::Type,
         llfn: Self::Value,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,

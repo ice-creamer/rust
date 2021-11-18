@@ -284,7 +284,7 @@ impl ParenthesizedArgs {
 
 pub use crate::node_id::{NodeId, CRATE_NODE_ID, DUMMY_NODE_ID};
 
-/// A modifier on a bound, e.g., `?Sized` or `?const Trait`.
+/// A modifier on a bound, e.g., `?Sized` or `~const Trait`.
 ///
 /// Negative bounds should also be handled here.
 #[derive(Copy, Clone, PartialEq, Eq, Encodable, Decodable, Debug)]
@@ -295,10 +295,10 @@ pub enum TraitBoundModifier {
     /// `?Trait`
     Maybe,
 
-    /// `?const Trait`
+    /// `~const Trait`
     MaybeConst,
 
-    /// `?const ?Trait`
+    /// `~const ?Trait`
     //
     // This parses but will be rejected during AST validation.
     MaybeConstMaybe,
@@ -332,10 +332,13 @@ pub type GenericBounds = Vec<GenericBound>;
 pub enum ParamKindOrd {
     Lifetime,
     Type,
-    // `unordered` is only `true` if `sess.has_features().const_generics`
-    // is active. Specifically, if it's only `min_const_generics`, it will still require
+    // `unordered` is only `true` if `sess.unordered_const_ty_params()`
+    // returns true. Specifically, if it's only `min_const_generics`, it will still require
     // ordering consts after types.
     Const { unordered: bool },
+    // `Infer` is not actually constructed directly from the AST, but is implicitly constructed
+    // during HIR lowering, and `ParamKindOrd` will implicitly order inferred variables last.
+    Infer,
 }
 
 impl Ord for ParamKindOrd {
@@ -343,7 +346,7 @@ impl Ord for ParamKindOrd {
         use ParamKindOrd::*;
         let to_int = |v| match v {
             Lifetime => 0,
-            Type | Const { unordered: true } => 1,
+            Infer | Type | Const { unordered: true } => 1,
             // technically both consts should be ordered equally,
             // but only one is ever encountered at a time, so this is
             // fine.
@@ -371,6 +374,7 @@ impl fmt::Display for ParamKindOrd {
             ParamKindOrd::Lifetime => "lifetime".fmt(f),
             ParamKindOrd::Type => "type".fmt(f),
             ParamKindOrd::Const { .. } => "const".fmt(f),
+            ParamKindOrd::Infer => "infer".fmt(f),
         }
     }
 }
@@ -498,13 +502,6 @@ pub struct Crate {
     pub attrs: Vec<Attribute>,
     pub items: Vec<P<Item>>,
     pub span: Span,
-    /// The order of items in the HIR is unrelated to the order of
-    /// items in the AST. However, we generate proc macro harnesses
-    /// based on the AST order, and later refer to these harnesses
-    /// from the HIR. This field keeps track of the order in which
-    /// we generated proc macros harnesses, so that we can map
-    /// HIR proc macros items back to their harness items.
-    pub proc_macros: Vec<NodeId>,
 }
 
 /// Possible values inside of compile-time attribute lists.
@@ -561,6 +558,14 @@ pub struct Block {
     pub rules: BlockCheckMode,
     pub span: Span,
     pub tokens: Option<LazyTokenStream>,
+    /// The following *isn't* a parse error, but will cause multiple errors in following stages.
+    /// ```
+    /// let x = {
+    ///     foo: var
+    /// };
+    /// ```
+    /// #34255
+    pub could_be_bare_literal: bool,
 }
 
 /// A match pattern.
@@ -677,7 +682,9 @@ pub enum BindingMode {
 
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum RangeEnd {
+    /// `..=` or `...`
     Included(RangeSyntax),
+    /// `..`
     Excluded,
 }
 
@@ -689,6 +696,7 @@ pub enum RangeSyntax {
     DotDotEq,
 }
 
+/// All the different flavors of pattern that Rust recognizes.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum PatKind {
     /// Represents a wildcard pattern (`_`).
@@ -729,7 +737,7 @@ pub enum PatKind {
     /// A literal.
     Lit(P<Expr>),
 
-    /// A range pattern (e.g., `1...2`, `1..=2` or `1..2`).
+    /// A range pattern (e.g., `1...2`, `1..2`, `1..`, `..2`, `1..=2`, `..=2`).
     Range(Option<P<Expr>>, Option<P<Expr>>, Spanned<RangeEnd>),
 
     /// A slice pattern `[a, b, c]`.
@@ -998,11 +1006,40 @@ pub struct Local {
     pub id: NodeId,
     pub pat: P<Pat>,
     pub ty: Option<P<Ty>>,
-    /// Initializer expression to set the value, if any.
-    pub init: Option<P<Expr>>,
+    pub kind: LocalKind,
     pub span: Span,
     pub attrs: AttrVec,
     pub tokens: Option<LazyTokenStream>,
+}
+
+#[derive(Clone, Encodable, Decodable, Debug)]
+pub enum LocalKind {
+    /// Local declaration.
+    /// Example: `let x;`
+    Decl,
+    /// Local declaration with an initializer.
+    /// Example: `let x = y;`
+    Init(P<Expr>),
+    /// Local declaration with an initializer and an `else` clause.
+    /// Example: `let Some(x) = y else { return };`
+    InitElse(P<Expr>, P<Block>),
+}
+
+impl LocalKind {
+    pub fn init(&self) -> Option<&Expr> {
+        match self {
+            Self::Decl => None,
+            Self::Init(i) | Self::InitElse(i, _) => Some(i),
+        }
+    }
+
+    pub fn init_else_opt(&self) -> Option<(&Expr, Option<&Block>)> {
+        match self {
+            Self::Decl => None,
+            Self::Init(init) => Some((init, None)),
+            Self::InitElse(init, els) => Some((init, Some(els))),
+        }
+    }
 }
 
 /// An arm of a 'match'.
@@ -1017,7 +1054,7 @@ pub struct Local {
 /// ```
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct Arm {
-    pub attrs: Vec<Attribute>,
+    pub attrs: AttrVec,
     /// Match arm pattern, e.g. `10` in `match foo { 10 => {}, _ => {} }`
     pub pat: P<Pat>,
     /// Match arm guard, e.g. `n > 10` in `match foo { n if n > 10 => {}, _ => {} }`
@@ -1174,6 +1211,8 @@ impl Expr {
                 }
             }
 
+            ExprKind::Underscore => TyKind::Infer,
+
             // This expression doesn't look like a type syntactically.
             _ => return None,
         };
@@ -1295,7 +1334,9 @@ pub enum ExprKind {
     Type(P<Expr>, P<Ty>),
     /// A `let pat = expr` expression that is only semantically allowed in the condition
     /// of `if` / `while` expressions. (e.g., `if let 0 = x { .. }`).
-    Let(P<Pat>, P<Expr>),
+    ///
+    /// `Span` represents the whole `let pat = expr` statement.
+    Let(P<Pat>, P<Expr>, Span),
     /// An `if` block, with an optional `else` block.
     ///
     /// `if expr { block } else { expr }`
@@ -1863,10 +1904,6 @@ pub enum TyKind {
     Never,
     /// A tuple (`(A, B, C, D,...)`).
     Tup(Vec<P<Ty>>),
-    /// An anonymous struct type i.e. `struct { foo: Type }`
-    AnonymousStruct(Vec<FieldDef>, bool),
-    /// An anonymous union type i.e. `union { bar: Type }`
-    AnonymousUnion(Vec<FieldDef>, bool),
     /// A path (`module::module::...::Type`), optionally
     /// "qualified", e.g., `<Vec<T> as SomeTrait>::SomeType`.
     ///
@@ -1935,6 +1972,7 @@ bitflags::bitflags! {
         const NORETURN = 1 << 4;
         const NOSTACK = 1 << 5;
         const ATT_SYNTAX = 1 << 6;
+        const RAW = 1 << 7;
     }
 }
 
@@ -2018,7 +2056,9 @@ pub enum InlineAsmOperand {
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct InlineAsm {
     pub template: Vec<InlineAsmTemplatePiece>,
+    pub template_strs: Box<[(Symbol, Option<Symbol>, Span)]>,
     pub operands: Vec<(InlineAsmOperand, Span)>,
+    pub clobber_abis: Vec<(Symbol, Span)>,
     pub options: InlineAsmOptions,
     pub line_spans: Vec<Span>,
 }
@@ -2293,7 +2333,7 @@ pub struct EnumDef {
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct Variant {
     /// Attributes of the variant.
-    pub attrs: Vec<Attribute>,
+    pub attrs: AttrVec,
     /// Id of the variant (not the constructor, see `VariantData::ctor_id()`).
     pub id: NodeId,
     /// Span
@@ -2474,7 +2514,7 @@ impl VisibilityKind {
 /// E.g., `bar: usize` as in `struct Foo { bar: usize }`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct FieldDef {
-    pub attrs: Vec<Attribute>,
+    pub attrs: AttrVec,
     pub id: NodeId,
     pub span: Span,
     pub vis: Visibility,
@@ -2605,34 +2645,42 @@ impl Default for FnHeader {
 }
 
 #[derive(Clone, Encodable, Decodable, Debug)]
-pub struct TraitKind(
-    pub IsAuto,
-    pub Unsafe,
-    pub Generics,
-    pub GenericBounds,
-    pub Vec<P<AssocItem>>,
-);
-
-#[derive(Clone, Encodable, Decodable, Debug)]
-pub struct TyAliasKind(pub Defaultness, pub Generics, pub GenericBounds, pub Option<P<Ty>>);
-
-#[derive(Clone, Encodable, Decodable, Debug)]
-pub struct ImplKind {
+pub struct Trait {
     pub unsafety: Unsafe,
-    pub polarity: ImplPolarity,
-    pub defaultness: Defaultness,
-    pub constness: Const,
+    pub is_auto: IsAuto,
     pub generics: Generics,
+    pub bounds: GenericBounds,
+    pub items: Vec<P<AssocItem>>,
+}
 
+#[derive(Clone, Encodable, Decodable, Debug)]
+pub struct TyAlias {
+    pub defaultness: Defaultness,
+    pub generics: Generics,
+    pub bounds: GenericBounds,
+    pub ty: Option<P<Ty>>,
+}
+
+#[derive(Clone, Encodable, Decodable, Debug)]
+pub struct Impl {
+    pub defaultness: Defaultness,
+    pub unsafety: Unsafe,
+    pub generics: Generics,
+    pub constness: Const,
+    pub polarity: ImplPolarity,
     /// The trait being implemented, if any.
     pub of_trait: Option<TraitRef>,
-
     pub self_ty: P<Ty>,
     pub items: Vec<P<AssocItem>>,
 }
 
 #[derive(Clone, Encodable, Decodable, Debug)]
-pub struct FnKind(pub Defaultness, pub FnSig, pub Generics, pub Option<P<Block>>);
+pub struct Fn {
+    pub defaultness: Defaultness,
+    pub generics: Generics,
+    pub sig: FnSig,
+    pub body: Option<P<Block>>,
+}
 
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum ItemKind {
@@ -2655,7 +2703,7 @@ pub enum ItemKind {
     /// A function declaration (`fn`).
     ///
     /// E.g., `fn foo(bar: usize) -> usize { .. }`.
-    Fn(Box<FnKind>),
+    Fn(Box<Fn>),
     /// A module declaration (`mod`).
     ///
     /// E.g., `mod foo;` or `mod foo { .. }`.
@@ -2667,11 +2715,11 @@ pub enum ItemKind {
     /// E.g., `extern {}` or `extern "C" {}`.
     ForeignMod(ForeignMod),
     /// Module-level inline assembly (from `global_asm!()`).
-    GlobalAsm(InlineAsm),
+    GlobalAsm(Box<InlineAsm>),
     /// A type alias (`type`).
     ///
     /// E.g., `type Foo = Bar<u8>;`.
-    TyAlias(Box<TyAliasKind>),
+    TyAlias(Box<TyAlias>),
     /// An enum definition (`enum`).
     ///
     /// E.g., `enum Foo<A, B> { C<A>, D<B> }`.
@@ -2687,7 +2735,7 @@ pub enum ItemKind {
     /// A trait declaration (`trait`).
     ///
     /// E.g., `trait Foo { .. }`, `trait Foo<T> { .. }` or `auto trait Foo {}`.
-    Trait(Box<TraitKind>),
+    Trait(Box<Trait>),
     /// Trait alias
     ///
     /// E.g., `trait Foo = Bar + Quux;`.
@@ -2695,7 +2743,7 @@ pub enum ItemKind {
     /// An implementation.
     ///
     /// E.g., `impl<A> Foo<A> { .. }` or `impl<A> Trait for Foo<A> { .. }`.
-    Impl(Box<ImplKind>),
+    Impl(Box<Impl>),
     /// A macro invocation.
     ///
     /// E.g., `foo!(..)`.
@@ -2742,14 +2790,14 @@ impl ItemKind {
 
     pub fn generics(&self) -> Option<&Generics> {
         match self {
-            Self::Fn(box FnKind(_, _, generics, _))
-            | Self::TyAlias(box TyAliasKind(_, generics, ..))
+            Self::Fn(box Fn { generics, .. })
+            | Self::TyAlias(box TyAlias { generics, .. })
             | Self::Enum(_, generics)
             | Self::Struct(_, generics)
             | Self::Union(_, generics)
-            | Self::Trait(box TraitKind(_, _, generics, ..))
+            | Self::Trait(box Trait { generics, .. })
             | Self::TraitAlias(generics, _)
-            | Self::Impl(box ImplKind { generics, .. }) => Some(generics),
+            | Self::Impl(box Impl { generics, .. }) => Some(generics),
             _ => None,
         }
     }
@@ -2772,9 +2820,9 @@ pub enum AssocItemKind {
     /// If `def` is parsed, then the constant is provided, and otherwise required.
     Const(Defaultness, P<Ty>, Option<P<Expr>>),
     /// An associated function.
-    Fn(Box<FnKind>),
+    Fn(Box<Fn>),
     /// An associated type.
-    TyAlias(Box<TyAliasKind>),
+    TyAlias(Box<TyAlias>),
     /// A macro expanding to associated items.
     MacCall(MacCall),
 }
@@ -2785,9 +2833,9 @@ rustc_data_structures::static_assert_size!(AssocItemKind, 72);
 impl AssocItemKind {
     pub fn defaultness(&self) -> Defaultness {
         match *self {
-            Self::Const(def, ..)
-            | Self::Fn(box FnKind(def, ..))
-            | Self::TyAlias(box TyAliasKind(def, ..)) => def,
+            Self::Const(defaultness, ..)
+            | Self::Fn(box Fn { defaultness, .. })
+            | Self::TyAlias(box TyAlias { defaultness, .. }) => defaultness,
             Self::MacCall(..) => Defaultness::Final,
         }
     }
@@ -2824,9 +2872,9 @@ pub enum ForeignItemKind {
     /// A foreign static item (`static FOO: u8`).
     Static(P<Ty>, Mutability, Option<P<Expr>>),
     /// An foreign function.
-    Fn(Box<FnKind>),
+    Fn(Box<Fn>),
     /// An foreign type.
-    TyAlias(Box<TyAliasKind>),
+    TyAlias(Box<TyAlias>),
     /// A macro expanding to foreign items.
     MacCall(MacCall),
 }

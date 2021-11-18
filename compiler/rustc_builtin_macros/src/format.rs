@@ -3,8 +3,8 @@ use Position::*;
 
 use rustc_ast as ast;
 use rustc_ast::ptr::P;
-use rustc_ast::token;
 use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::{token, BlockCheckMode, UnsafeSource};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::{pluralize, Applicability, DiagnosticBuilder};
 use rustc_expand::base::{self, *};
@@ -164,23 +164,22 @@ fn parse_args<'a>(
                 p.clear_expected_tokens();
             }
 
-            // `Parser::expect` tries to recover using the
-            // `Parser::unexpected_try_recover` function. This function is able
-            // to recover if the expected token is a closing delimiter.
-            //
-            // As `,` is not a closing delimiter, it will always return an `Err`
-            // variant.
-            let mut err = p.expect(&token::Comma).unwrap_err();
-
-            match token::TokenKind::Comma.similar_tokens() {
-                Some(tks) if tks.contains(&p.token.kind) => {
-                    // If a similar token is found, then it may be a typo. We
-                    // consider it as a comma, and continue parsing.
-                    err.emit();
-                    p.bump();
+            match p.expect(&token::Comma) {
+                Err(mut err) => {
+                    match token::TokenKind::Comma.similar_tokens() {
+                        Some(tks) if tks.contains(&p.token.kind) => {
+                            // If a similar token is found, then it may be a typo. We
+                            // consider it as a comma, and continue parsing.
+                            err.emit();
+                            p.bump();
+                        }
+                        // Otherwise stop the parsing and return the error.
+                        _ => return Err(err),
+                    }
                 }
-                // Otherwise stop the parsing and return the error.
-                _ => return Err(err),
+                Ok(recovered) => {
+                    assert!(recovered);
+                }
             }
         }
         first = false;
@@ -528,17 +527,9 @@ impl<'a, 'b> Context<'a, 'b> {
                         self.verify_arg_type(Exact(idx), ty)
                     }
                     None => {
-                        let capture_feature_enabled = self
-                            .ecx
-                            .ecfg
-                            .features
-                            .map_or(false, |features| features.format_args_capture);
-
                         // For the moment capturing variables from format strings expanded from macros is
                         // disabled (see RFC #2795)
-                        let can_capture = capture_feature_enabled && self.is_literal;
-
-                        if can_capture {
+                        if self.is_literal {
                             // Treat this name as a variable to capture from the surrounding scope
                             let idx = self.args.len();
                             self.arg_types.push(Vec::new());
@@ -560,23 +551,15 @@ impl<'a, 'b> Context<'a, 'b> {
                             };
                             let mut err = self.ecx.struct_span_err(sp, &msg[..]);
 
-                            if capture_feature_enabled && !self.is_literal {
-                                err.note(&format!(
-                                    "did you intend to capture a variable `{}` from \
-                                     the surrounding scope?",
-                                    name
-                                ));
-                                err.note(
-                                    "to avoid ambiguity, `format_args!` cannot capture variables \
-                                     when the format string is expanded from a macro",
-                                );
-                            } else if self.ecx.parse_sess().unstable_features.is_nightly_build() {
-                                err.help(&format!(
-                                    "if you intended to capture `{}` from the surrounding scope, add \
-                                     `#![feature(format_args_capture)]` to the crate attributes",
-                                    name
-                                ));
-                            }
+                            err.note(&format!(
+                                "did you intend to capture a variable `{}` from \
+                                 the surrounding scope?",
+                                name
+                            ));
+                            err.note(
+                                "to avoid ambiguity, `format_args!` cannot capture variables \
+                                 when the format string is expanded from a macro",
+                            );
 
                             err.emit();
                         }
@@ -761,15 +744,10 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Actually builds the expression which the format_args! block will be
     /// expanded to.
     fn into_expr(self) -> P<ast::Expr> {
-        let mut locals =
-            Vec::with_capacity((0..self.args.len()).map(|i| self.arg_unique_types[i].len()).sum());
-        let mut counts = Vec::with_capacity(self.count_args.len());
-        let mut pats = Vec::with_capacity(self.args.len());
+        let mut args = Vec::with_capacity(
+            self.arg_unique_types.iter().map(|v| v.len()).sum::<usize>() + self.count_args.len(),
+        );
         let mut heads = Vec::with_capacity(self.args.len());
-
-        let names_pos: Vec<_> = (0..self.args.len())
-            .map(|i| Ident::from_str_and_span(&format!("arg{}", i), self.macsp))
-            .collect();
 
         // First, build up the static array which will become our precompiled
         // format "string"
@@ -788,11 +766,8 @@ impl<'a, 'b> Context<'a, 'b> {
         // of each variable because we don't want to move out of the arguments
         // passed to this function.
         for (i, e) in self.args.into_iter().enumerate() {
-            let name = names_pos[i];
-            let span = self.ecx.with_def_site_ctxt(e.span);
-            pats.push(self.ecx.pat_ident(span, name));
             for arg_ty in self.arg_unique_types[i].iter() {
-                locals.push(Context::format_arg(self.ecx, self.macsp, e.span, arg_ty, name));
+                args.push(Context::format_arg(self.ecx, self.macsp, e.span, arg_ty, i));
             }
             heads.push(self.ecx.expr_addr_of(e.span, e));
         }
@@ -801,15 +776,11 @@ impl<'a, 'b> Context<'a, 'b> {
                 Exact(i) => i,
                 _ => panic!("should never happen"),
             };
-            let name = names_pos[index];
             let span = spans_pos[index];
-            counts.push(Context::format_arg(self.ecx, self.macsp, span, &Count, name));
+            args.push(Context::format_arg(self.ecx, self.macsp, span, &Count, index));
         }
 
-        // Now create a vector containing all the arguments
-        let args = locals.into_iter().chain(counts.into_iter());
-
-        let args_array = self.ecx.expr_vec(self.macsp, args.collect());
+        let args_array = self.ecx.expr_vec(self.macsp, args);
 
         // Constructs an AST equivalent to:
         //
@@ -838,12 +809,14 @@ impl<'a, 'b> Context<'a, 'b> {
         //
         // But the nested match expression is proved to perform not as well
         // as series of let's; the first approach does.
-        let pat = self.ecx.pat_tuple(self.macsp, pats);
-        let arm = self.ecx.arm(self.macsp, pat, args_array);
-        let head = self.ecx.expr(self.macsp, ast::ExprKind::Tup(heads));
-        let result = self.ecx.expr_match(self.macsp, head, vec![arm]);
+        let args_match = {
+            let pat = self.ecx.pat_ident(self.macsp, Ident::new(sym::_args, self.macsp));
+            let arm = self.ecx.arm(self.macsp, pat, args_array);
+            let head = self.ecx.expr(self.macsp, ast::ExprKind::Tup(heads));
+            self.ecx.expr_match(self.macsp, head, vec![arm])
+        };
 
-        let args_slice = self.ecx.expr_addr_of(self.macsp, result);
+        let args_slice = self.ecx.expr_addr_of(self.macsp, args_match);
 
         // Now create the fmt::Arguments struct with all our locals we created.
         let (fn_name, fn_args) = if self.all_pieces_simple {
@@ -853,7 +826,18 @@ impl<'a, 'b> Context<'a, 'b> {
             // nonstandard placeholders, if there are any.
             let fmt = self.ecx.expr_vec_slice(self.macsp, self.pieces);
 
-            ("new_v1_formatted", vec![pieces, args_slice, fmt])
+            let path = self.ecx.std_path(&[sym::fmt, sym::UnsafeArg, sym::new]);
+            let unsafe_arg = self.ecx.expr_call_global(self.macsp, path, Vec::new());
+            let unsafe_expr = self.ecx.expr_block(P(ast::Block {
+                stmts: vec![self.ecx.stmt_expr(unsafe_arg)],
+                id: ast::DUMMY_NODE_ID,
+                rules: BlockCheckMode::Unsafe(UnsafeSource::CompilerGenerated),
+                span: self.macsp,
+                tokens: None,
+                could_be_bare_literal: false,
+            }));
+
+            ("new_v1_formatted", vec![pieces, args_slice, fmt, unsafe_expr])
         };
 
         let path = self.ecx.std_path(&[sym::fmt, sym::Arguments, Symbol::intern(fn_name)]);
@@ -865,10 +849,11 @@ impl<'a, 'b> Context<'a, 'b> {
         macsp: Span,
         mut sp: Span,
         ty: &ArgumentType,
-        arg: Ident,
+        arg_index: usize,
     ) -> P<ast::Expr> {
         sp = ecx.with_def_site_ctxt(sp);
-        let arg = ecx.expr_ident(sp, arg);
+        let arg = ecx.expr_ident(sp, Ident::new(sym::_args, sp));
+        let arg = ecx.expr(sp, ast::ExprKind::Field(arg, Ident::new(sym::integer(arg_index), sp)));
         let trait_ = match *ty {
             Placeholder(trait_) if trait_ == "<invalid>" => return DummyResult::raw_expr(sp, true),
             Placeholder(trait_) => trait_,
@@ -939,6 +924,7 @@ pub fn expand_preparsed_format_args(
 
     let msg = "format argument must be a string literal";
     let fmt_sp = efmt.span;
+    let efmt_kind_is_lit: bool = matches!(efmt.kind, ast::ExprKind::Lit(_));
     let (fmt_str, fmt_style, fmt_span) = match expr_to_spanned_string(ecx, efmt, msg) {
         Ok(mut fmt) if append_newline => {
             fmt.0 = Symbol::intern(&format!("{}\n", fmt.0));
@@ -946,17 +932,19 @@ pub fn expand_preparsed_format_args(
         }
         Ok(fmt) => fmt,
         Err(err) => {
-            if let Some(mut err) = err {
+            if let Some((mut err, suggested)) = err {
                 let sugg_fmt = match args.len() {
                     0 => "{}".to_string(),
                     _ => format!("{}{{}}", "{} ".repeat(args.len())),
                 };
-                err.span_suggestion(
-                    fmt_sp.shrink_to_lo(),
-                    "you might be missing a string literal to format with",
-                    format!("\"{}\", ", sugg_fmt),
-                    Applicability::MaybeIncorrect,
-                );
+                if !suggested {
+                    err.span_suggestion(
+                        fmt_sp.shrink_to_lo(),
+                        "you might be missing a string literal to format with",
+                        format!("\"{}\", ", sugg_fmt),
+                        Applicability::MaybeIncorrect,
+                    );
+                }
                 err.emit();
             }
             return DummyResult::raw_expr(sp, true);
@@ -989,7 +977,19 @@ pub fn expand_preparsed_format_args(
 
     if !parser.errors.is_empty() {
         let err = parser.errors.remove(0);
-        let sp = fmt_span.from_inner(err.span);
+        let sp = if efmt_kind_is_lit {
+            fmt_span.from_inner(err.span)
+        } else {
+            // The format string could be another macro invocation, e.g.:
+            //     format!(concat!("abc", "{}"), 4);
+            // However, `err.span` is an inner span relative to the *result* of
+            // the macro invocation, which is why we would get a nonsensical
+            // result calling `fmt_span.from_inner(err.span)` as above, and
+            // might even end up inside a multibyte character (issue #86085).
+            // Therefore, we conservatively report the error for the entire
+            // argument span here.
+            fmt_span
+        };
         let mut e = ecx.struct_span_err(sp, &format!("invalid format string: {}", err.description));
         e.span_label(sp, err.label + " in format string");
         if let Some(note) = err.note {
@@ -1127,11 +1127,12 @@ pub fn expand_preparsed_format_args(
                     // account for `"` and account for raw strings `r#`
                     let padding = str_style.map(|i| i + 2).unwrap_or(1);
                     for sub in foreign::$kind::iter_subs(fmt_str, padding) {
-                        let trn = match sub.translate() {
-                            Some(trn) => trn,
+                        let (trn, success) = match sub.translate() {
+                            Ok(trn) => (trn, true),
+                            Err(Some(msg)) => (msg, false),
 
                             // If it has no translation, don't call it out specifically.
-                            None => continue,
+                            _ => continue,
                         };
 
                         let pos = sub.position();
@@ -1148,9 +1149,24 @@ pub fn expand_preparsed_format_args(
 
                         if let Some(inner_sp) = pos {
                             let sp = fmt_sp.from_inner(inner_sp);
-                            suggestions.push((sp, trn));
+
+                            if success {
+                                suggestions.push((sp, trn));
+                            } else {
+                                diag.span_note(
+                                    sp,
+                                    &format!("format specifiers use curly braces, and {}", trn),
+                                );
+                            }
                         } else {
-                            diag.help(&format!("`{}` should be written as `{}`", sub, trn));
+                            if success {
+                                diag.help(&format!("`{}` should be written as `{}`", sub, trn));
+                            } else {
+                                diag.note(&format!(
+                                    "`{}` should use curly braces, and {}",
+                                    sub, trn
+                                ));
+                            }
                         }
                     }
 

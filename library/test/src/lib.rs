@@ -20,10 +20,10 @@
 #![crate_name = "test"]
 #![unstable(feature = "test", issue = "50297")]
 #![doc(test(attr(deny(warnings))))]
-#![cfg_attr(unix, feature(libc))]
+#![feature(libc)]
 #![feature(rustc_private)]
 #![feature(nll)]
-#![feature(available_concurrency)]
+#![feature(available_parallelism)]
 #![feature(bench_black_box)]
 #![feature(internal_output_capture)]
 #![feature(panic_unwind)]
@@ -80,6 +80,7 @@ mod formatters;
 mod helpers;
 mod options;
 pub mod stats;
+mod term;
 mod test_result;
 mod time;
 mod types;
@@ -90,6 +91,7 @@ mod tests;
 use event::{CompletedTest, TestEvent};
 use helpers::concurrency::get_concurrency;
 use helpers::exit_code::get_exit_code;
+use helpers::shuffle::{get_shuffle_seed, shuffle_tests};
 use options::{Concurrent, RunStrategy};
 use test_result::*;
 use time::TestExecTime;
@@ -246,7 +248,9 @@ where
 
     let filtered_descs = filtered_tests.iter().map(|t| t.desc.clone()).collect();
 
-    let event = TestEvent::TeFiltered(filtered_descs);
+    let shuffle_seed = get_shuffle_seed(opts);
+
+    let event = TestEvent::TeFiltered(filtered_descs, shuffle_seed);
     notify_about_test_event(event)?;
 
     let (filtered_tests, filtered_benchs): (Vec<_>, _) = filtered_tests
@@ -258,7 +262,11 @@ where
     let concurrency = opts.test_threads.unwrap_or_else(get_concurrency);
 
     let mut remaining = filtered_tests;
-    remaining.reverse();
+    if let Some(shuffle_seed) = shuffle_seed {
+        shuffle_tests(shuffle_seed, &mut remaining);
+    } else {
+        remaining.reverse();
+    }
     let mut pending = 0;
 
     let (tx, rx) = channel::<CompletedTest>();

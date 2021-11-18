@@ -13,14 +13,14 @@ use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::symbol::sym;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks slow zero-filled vector initialization
+    /// ### What it does
+    /// Checks slow zero-filled vector initialization
     ///
-    /// **Why is this bad?** These structures are non-idiomatic and less efficient than simply using
+    /// ### Why is this bad?
+    /// These structures are non-idiomatic and less efficient than simply using
     /// `vec![0; len]`.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust
     /// # use core::iter::repeat;
     /// # let len = 4;
@@ -120,7 +120,7 @@ impl SlowVectorInit {
             if let ExprKind::Call(func, [arg]) = expr.kind;
             if let ExprKind::Path(QPath::TypeRelative(ty, name)) = func.kind;
             if name.ident.as_str() == "with_capacity";
-            if is_type_diagnostic_item(cx, cx.typeck_results().node_type(ty.hir_id), sym::vec_type);
+            if is_type_diagnostic_item(cx, cx.typeck_results().node_type(ty.hir_id), sym::Vec);
             then {
                 Some(arg)
             } else {

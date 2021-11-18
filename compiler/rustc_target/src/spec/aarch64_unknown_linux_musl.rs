@@ -10,7 +10,7 @@ pub fn target() -> Target {
         data_layout: "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128".to_string(),
         arch: "aarch64".to_string(),
         options: TargetOptions {
-            unsupported_abis: super::arm_base::unsupported_abis(),
+            features: "+outline-atomics".to_string(),
             mcount: "\u{1}_mcount".to_string(),
             ..base
         },

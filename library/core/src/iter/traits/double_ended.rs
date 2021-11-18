@@ -36,6 +36,7 @@ use crate::ops::{ControlFlow, Try};
 /// assert_eq!(None, iter.next_back());
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "DoubleEndedIterator")]
 pub trait DoubleEndedIterator: Iterator {
     /// Removes and returns an element from the end of the iterator.
     ///
@@ -102,9 +103,15 @@ pub trait DoubleEndedIterator: Iterator {
     /// elements the iterator is advanced by before running out of elements (i.e. the length
     /// of the iterator). Note that `k` is always less than `n`.
     ///
-    /// Calling `advance_back_by(0)` does not consume any elements and always returns [`Ok(())`].
+    /// Calling `advance_back_by(0)` can do meaningful work, for example [`Flatten`] can advance its
+    /// outer iterator until it finds an inner iterator that is not empty, which then often
+    /// allows it to return a more accurate `size_hint()` than in its initial state.
+    /// `advance_back_by(0)` may either return `Ok()` or `Err(0)`. The former conveys no information
+    /// whether the iterator is or is not exhausted, the latter can be treated as if [`next_back`]
+    /// had returned `None`. Replacing a `Err(0)` with `Ok` is only correct for `n = 0`.
     ///
     /// [`advance_by`]: Iterator::advance_by
+    /// [`Flatten`]: crate::iter::Flatten
     /// [`next_back`]: DoubleEndedIterator::next_back
     ///
     /// # Examples
@@ -248,6 +255,11 @@ pub trait DoubleEndedIterator: Iterator {
     /// Folding is useful whenever you have a collection of something, and want
     /// to produce a single value from it.
     ///
+    /// Note: `rfold()` combines elements in a *right-associative* fashion. For associative
+    /// operators like `+`, the order the elements are combined in is not important, but for non-associative
+    /// operators like `-` the order will affect the final result.
+    /// For a *left-associative* version of `rfold()`, see [`Iterator::fold()`].
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -262,7 +274,8 @@ pub trait DoubleEndedIterator: Iterator {
     /// assert_eq!(sum, 6);
     /// ```
     ///
-    /// This example builds a string, starting with an initial value
+    /// This example demonstrates the right-associative nature of `rfold()`:
+    /// it builds a string, starting with an initial value
     /// and continuing with each element from the back until the front:
     ///
     /// ```
@@ -276,6 +289,7 @@ pub trait DoubleEndedIterator: Iterator {
     ///
     /// assert_eq!(result, "(1 + (2 + (3 + (4 + (5 + 0)))))");
     /// ```
+    #[doc(alias = "foldr")]
     #[inline]
     #[stable(feature = "iter_rfold", since = "1.27.0")]
     fn rfold<B, F>(mut self, init: B, mut f: F) -> B

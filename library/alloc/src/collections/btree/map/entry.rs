@@ -14,6 +14,7 @@ use Entry::*;
 ///
 /// [`entry`]: BTreeMap::entry
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "BTreeEntry")]
 pub enum Entry<'a, K: 'a, V: 'a> {
     /// A vacant entry.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -346,6 +347,7 @@ impl<'a, K: Ord, V> OccupiedEntry<'a, K, V> {
     /// map.entry("poneyland").or_insert(12);
     /// assert_eq!(map.entry("poneyland").key(), &"poneyland");
     /// ```
+    #[must_use]
     #[stable(feature = "map_entry_keys", since = "1.10.0")]
     pub fn key(&self) -> &K {
         self.handle.reborrow().into_kv().0
@@ -390,6 +392,7 @@ impl<'a, K: Ord, V> OccupiedEntry<'a, K, V> {
     ///     assert_eq!(o.get(), &12);
     /// }
     /// ```
+    #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get(&self) -> &V {
         self.handle.reborrow().into_kv().1
@@ -447,6 +450,7 @@ impl<'a, K: Ord, V> OccupiedEntry<'a, K, V> {
     /// }
     /// assert_eq!(map["poneyland"], 22);
     /// ```
+    #[must_use = "`self` will be dropped if the result is not used"]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn into_mut(self) -> &'a mut V {
         self.handle.into_val_mut()

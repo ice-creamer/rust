@@ -7,11 +7,14 @@ use rustc_span::source_map::Span;
 
 mod different_lifetimes;
 pub mod find_anon_type;
+mod mismatched_static_lifetime;
 mod named_anon_conflict;
 mod placeholder_error;
 mod static_impl_trait;
 mod trait_impl_difference;
 mod util;
+
+pub use static_impl_trait::suggest_new_region_bound;
 
 impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
     pub fn try_report_nice_region_error(&self, error: &RegionResolutionError<'tcx>) -> bool {
@@ -58,6 +61,7 @@ impl<'cx, 'tcx> NiceRegionError<'cx, 'tcx> {
             .or_else(|| self.try_report_impl_not_conforming_to_trait())
             .or_else(|| self.try_report_anon_anon_conflict())
             .or_else(|| self.try_report_static_impl_trait())
+            .or_else(|| self.try_report_mismatched_static_lifetime())
     }
 
     pub fn regions(&self) -> Option<(Span, ty::Region<'tcx>, ty::Region<'tcx>)> {

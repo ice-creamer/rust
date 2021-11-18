@@ -1,11 +1,10 @@
 use crate::cgu_reuse_tracker::CguReuseTracker;
 use crate::code_stats::CodeStats;
 pub use crate::code_stats::{DataTypeKind, FieldInfo, SizeKind, VariantInfo};
-use crate::config::{self, CrateType, OutputType, PrintRequest, SwitchWithOptPath};
-use crate::filesearch;
-use crate::lint::{self, LintId};
+use crate::config::{self, CrateType, OutputType, SwitchWithOptPath};
 use crate::parse::ParseSess;
 use crate::search_paths::{PathKind, SearchPath};
+use crate::{filesearch, lint};
 
 pub use rustc_ast::attr::MarkedAttrs;
 pub use rustc_ast::Attribute;
@@ -20,11 +19,11 @@ use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitterWriter;
 use rustc_errors::emitter::{Emitter, EmitterWriter, HumanReadableErrorType};
 use rustc_errors::json::JsonEmitter;
 use rustc_errors::registry::Registry;
-use rustc_errors::{Diagnostic, DiagnosticBuilder, DiagnosticId, ErrorReported};
-use rustc_lint_defs::FutureBreakage;
-pub use rustc_span::crate_disambiguator::CrateDisambiguator;
+use rustc_errors::{DiagnosticBuilder, DiagnosticId, ErrorReported};
+use rustc_macros::HashStable_Generic;
+pub use rustc_span::def_id::StableCrateId;
+use rustc_span::edition::Edition;
 use rustc_span::source_map::{FileLoader, MultiSpan, RealFileLoader, SourceMap, Span};
-use rustc_span::{edition::Edition, RealFileName};
 use rustc_span::{sym, SourceFileHashAlgorithm, Symbol};
 use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{CodeModel, PanicStrategy, RelocModel, RelroLevel};
@@ -36,14 +35,10 @@ use std::fmt;
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::ops::{Div, Mul};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-
-pub trait SessionLintStore: sync::Send + sync::Sync {
-    fn name_to_lint(&self, lint_name: &str) -> LintId;
-}
 
 pub struct OptimizationFuel {
     /// If `-zfuel=crate=n` is specified, initially set to `n`, otherwise `0`.
@@ -66,7 +61,7 @@ pub enum CtfeBacktrace {
 
 /// New-type wrapper around `usize` for representing limits. Ensures that comparisons against
 /// limits are consistent throughout the compiler.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, HashStable_Generic)]
 pub struct Limit(pub usize);
 
 impl Limit {
@@ -111,52 +106,47 @@ impl Mul<usize> for Limit {
     }
 }
 
+#[derive(Clone, Copy, Debug, HashStable_Generic)]
+pub struct Limits {
+    /// The maximum recursion limit for potentially infinitely recursive
+    /// operations such as auto-dereference and monomorphization.
+    pub recursion_limit: Limit,
+    /// The size at which the `large_assignments` lint starts
+    /// being emitted.
+    pub move_size_limit: Limit,
+    /// The maximum length of types during monomorphization.
+    pub type_length_limit: Limit,
+    /// The maximum blocks a const expression can evaluate.
+    pub const_eval_limit: Limit,
+}
+
 /// Represents the data associated with a compilation
 /// session for a single crate.
 pub struct Session {
     pub target: Target,
     pub host: Target,
     pub opts: config::Options,
-    pub host_tlib_path: SearchPath,
-    /// `None` if the host and target are the same.
-    pub target_tlib_path: Option<SearchPath>,
+    pub host_tlib_path: Lrc<SearchPath>,
+    pub target_tlib_path: Lrc<SearchPath>,
     pub parse_sess: ParseSess,
     pub sysroot: PathBuf,
     /// The name of the root source file of the crate, in the local file system.
     /// `None` means that there is no source file.
     pub local_crate_source_file: Option<PathBuf>,
-    /// The directory the compiler has been executed in
-    pub working_dir: RealFileName,
 
     /// Set of `(DiagnosticId, Option<Span>, message)` tuples tracking
     /// (sub)diagnostics that have been set once, but should not be set again,
     /// in order to avoid redundantly verbose output (Issue #24690, #44953).
     pub one_time_diagnostics: Lock<FxHashSet<(DiagnosticMessageId, Option<Span>, String)>>,
     crate_types: OnceCell<Vec<CrateType>>,
-    /// The `crate_disambiguator` is constructed out of all the `-C metadata`
-    /// arguments passed to the compiler. Its value together with the crate-name
-    /// forms a unique global identifier for the crate. It is used to allow
-    /// multiple crates with the same name to coexist. See the
+    /// The `stable_crate_id` is constructed out of the crate name and all the
+    /// `-C metadata` arguments passed to the compiler. Its value forms a unique
+    /// global identifier for the crate. It is used to allow multiple crates
+    /// with the same name to coexist. See the
     /// `rustc_codegen_llvm::back::symbol_names` module for more information.
-    pub crate_disambiguator: OnceCell<CrateDisambiguator>,
+    pub stable_crate_id: OnceCell<StableCrateId>,
 
     features: OnceCell<rustc_feature::Features>,
-
-    lint_store: OnceCell<Lrc<dyn SessionLintStore>>,
-
-    /// The maximum recursion limit for potentially infinitely recursive
-    /// operations such as auto-dereference and monomorphization.
-    pub recursion_limit: OnceCell<Limit>,
-
-    /// The size at which the `large_assignments` lint starts
-    /// being emitted.
-    pub move_size_limit: OnceCell<usize>,
-
-    /// The maximum length of types during monomorphization.
-    pub type_length_limit: OnceCell<Limit>,
-
-    /// The maximum blocks a const expression can evaluate.
-    pub const_eval_limit: OnceCell<Limit>,
 
     incr_comp_session: OneThread<RefCell<IncrCompSession>>,
     /// Used for incremental compilation tests. Will only be populated if
@@ -172,15 +162,9 @@ pub struct Session {
     /// Data about code being compiled, gathered during compilation.
     pub code_stats: CodeStats,
 
-    /// If `-zfuel=crate=n` is specified, `Some(crate)`.
-    optimization_fuel_crate: Option<String>,
-
     /// Tracks fuel info if `-zfuel=crate=n` is specified.
     optimization_fuel: Lock<OptimizationFuel>,
 
-    // The next two are public because the driver needs to read them.
-    /// If `-zprint-fuel=crate`, `Some(crate)`.
-    pub print_fuel_crate: Option<String>,
     /// Always set to zero and incremented so that we can print fuel expended by a crate.
     pub print_fuel: AtomicU64,
 
@@ -191,20 +175,12 @@ pub struct Session {
     /// Cap lint level specified by a driver specifically.
     pub driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
 
-    /// `Span`s of trait methods that weren't found to avoid emitting object safety errors
-    pub trait_methods_not_found: Lock<FxHashSet<Span>>,
-
-    /// Mapping from ident span to path span for paths that don't exist as written, but that
-    /// exist under `std`. For example, wrote `str::from_utf8` instead of `std::str::from_utf8`.
-    pub confused_type_with_std_module: Lock<FxHashMap<Span, Span>>,
-
-    /// Path for libraries that will take preference over libraries shipped by Rust.
-    /// Used by windows-gnu targets to priortize system mingw-w64 libraries.
-    pub system_library_path: OneThread<RefCell<Option<Option<PathBuf>>>>,
-
     /// Tracks the current behavior of the CTFE engine when an error occurs.
     /// Options range from returning the error without a backtrace to returning an error
     /// and immediately printing the backtrace to stderr.
+    /// The `Lock` is only used by miri to allow setting `ctfe_backtrace` after analysis when
+    /// `MIRI_BACKTRACE` is set. This makes it only apply to miri's errors and not to all CTFE
+    /// errors.
     pub ctfe_backtrace: Lock<CtfeBacktrace>,
 
     /// This tracks where `-Zunleash-the-miri-inside-of-you` was used to get around a
@@ -218,12 +194,6 @@ pub struct Session {
 
     /// Set of enabled features for the current target.
     pub target_features: FxHashSet<Symbol>,
-
-    known_attrs: Lock<MarkedAttrs>,
-    used_attrs: Lock<MarkedAttrs>,
-
-    /// `Span`s for `if` conditions that we have suggested turning into `if let`.
-    pub if_let_suggestions: Lock<FxHashSet<Span>>,
 }
 
 pub struct PerfStats {
@@ -316,27 +286,11 @@ impl Session {
         if diags.is_empty() {
             return;
         }
-        // If any future-breakage lints were registered, this lint store
-        // should be available
-        let lint_store = self.lint_store.get().expect("`lint_store` not initialized!");
-        let diags_and_breakage: Vec<(FutureBreakage, Diagnostic)> = diags
-            .into_iter()
-            .map(|diag| {
-                let lint_name = match &diag.code {
-                    Some(DiagnosticId::Lint { name, has_future_breakage: true }) => name,
-                    _ => panic!("Unexpected code in diagnostic {:?}", diag),
-                };
-                let lint = lint_store.name_to_lint(&lint_name);
-                let future_breakage =
-                    lint.lint.future_incompatible.unwrap().future_breakage.unwrap();
-                (future_breakage, diag)
-            })
-            .collect();
-        self.parse_sess.span_diagnostic.emit_future_breakage_report(diags_and_breakage);
+        self.parse_sess.span_diagnostic.emit_future_breakage_report(diags);
     }
 
-    pub fn local_crate_disambiguator(&self) -> CrateDisambiguator {
-        self.crate_disambiguator.get().copied().unwrap()
+    pub fn local_stable_crate_id(&self) -> StableCrateId {
+        self.stable_crate_id.get().copied().unwrap()
     }
 
     pub fn crate_types(&self) -> &[CrateType] {
@@ -347,27 +301,15 @@ impl Session {
         self.crate_types.set(crate_types).expect("`crate_types` was initialized twice")
     }
 
-    #[inline]
-    pub fn recursion_limit(&self) -> Limit {
-        self.recursion_limit.get().copied().unwrap()
-    }
-
-    #[inline]
-    pub fn move_size_limit(&self) -> usize {
-        self.move_size_limit.get().copied().unwrap()
-    }
-
-    #[inline]
-    pub fn type_length_limit(&self) -> Limit {
-        self.type_length_limit.get().copied().unwrap()
-    }
-
-    pub fn const_eval_limit(&self) -> Limit {
-        self.const_eval_limit.get().copied().unwrap()
-    }
-
     pub fn struct_span_warn<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> DiagnosticBuilder<'_> {
         self.diagnostic().struct_span_warn(sp, msg)
+    }
+    pub fn struct_span_force_warn<S: Into<MultiSpan>>(
+        &self,
+        sp: S,
+        msg: &str,
+    ) -> DiagnosticBuilder<'_> {
+        self.diagnostic().struct_span_force_warn(sp, msg)
     }
     pub fn struct_span_warn_with_code<S: Into<MultiSpan>>(
         &self,
@@ -379,6 +321,9 @@ impl Session {
     }
     pub fn struct_warn(&self, msg: &str) -> DiagnosticBuilder<'_> {
         self.diagnostic().struct_warn(msg)
+    }
+    pub fn struct_force_warn(&self, msg: &str) -> DiagnosticBuilder<'_> {
+        self.diagnostic().struct_force_warn(msg)
     }
     pub fn struct_span_allow<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> DiagnosticBuilder<'_> {
         self.diagnostic().struct_span_allow(sp, msg)
@@ -466,7 +411,7 @@ impl Session {
         self.diagnostic().abort_if_errors();
     }
     pub fn compile_status(&self) -> Result<(), ErrorReported> {
-        if self.has_errors() {
+        if self.diagnostic().has_errors_or_lint_errors() {
             self.diagnostic().emit_stashed_diagnostics();
             Err(ErrorReported)
         } else {
@@ -480,8 +425,7 @@ impl Session {
     {
         let old_count = self.err_count();
         let result = f();
-        let errors = self.err_count() - old_count;
-        if errors == 0 { Ok(result) } else { Err(ErrorReported) }
+        if self.err_count() == old_count { Ok(result) } else { Err(ErrorReported) }
     }
     pub fn span_warn<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
         self.diagnostic().span_warn(sp, msg)
@@ -528,6 +472,10 @@ impl Session {
     #[inline]
     pub fn diagnostic(&self) -> &rustc_errors::Handler {
         &self.parse_sess.span_diagnostic
+    }
+
+    pub fn with_disabled_diagnostic<T, F: FnOnce() -> T>(&self, f: F) -> T {
+        self.parse_sess.span_diagnostic.with_disabled_diagnostic(f)
     }
 
     /// Analogous to calling methods on the given `DiagnosticBuilder`, but
@@ -633,13 +581,6 @@ impl Session {
         }
     }
 
-    pub fn init_lint_store(&self, lint_store: Lrc<dyn SessionLintStore>) {
-        self.lint_store
-            .set(lint_store)
-            .map_err(|_| ())
-            .expect("`lint_store` was initialized twice");
-    }
-
     /// Calculates the flavor of LTO to use for this compilation.
     pub fn lto(&self) -> config::Lto {
         // If our target has codegen requirements ignore the command line
@@ -731,6 +672,9 @@ impl Session {
     pub fn is_nightly_build(&self) -> bool {
         self.opts.unstable_features.is_nightly_build()
     }
+    pub fn is_sanitizer_cfi_enabled(&self) -> bool {
+        self.opts.debugging_opts.sanitizer.contains(SanitizerSet::CFI)
+    }
     pub fn overflow_checks(&self) -> bool {
         self.opts
             .cg
@@ -792,18 +736,6 @@ impl Session {
         !self.target.is_like_windows && !self.target.is_like_osx
     }
 
-    pub fn must_not_eliminate_frame_pointers(&self) -> bool {
-        // "mcount" function relies on stack pointer.
-        // See <https://sourceware.org/binutils/docs/gprof/Implementation.html>.
-        if self.instrument_mcount() {
-            true
-        } else if let Some(x) = self.opts.cg.force_frame_pointers {
-            x
-        } else {
-            !self.target.eliminate_frame_pointer
-        }
-    }
-
     pub fn must_emit_unwind_tables(&self) -> bool {
         // This is used to control the emission of the `uwtable` attribute on
         // LLVM functions.
@@ -831,14 +763,8 @@ impl Session {
             )
     }
 
-    /// Returns the symbol name for the registrar function,
-    /// given the crate `Svh` and the function `DefIndex`.
-    pub fn generate_plugin_registrar_symbol(&self, disambiguator: CrateDisambiguator) -> String {
-        format!("__rustc_plugin_registrar_{}__", disambiguator.to_fingerprint().to_hex())
-    }
-
-    pub fn generate_proc_macro_decls_symbol(&self, disambiguator: CrateDisambiguator) -> String {
-        format!("__rustc_proc_macro_decls_{}__", disambiguator.to_fingerprint().to_hex())
+    pub fn generate_proc_macro_decls_symbol(&self, stable_crate_id: StableCrateId) -> String {
+        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.to_u64())
     }
 
     pub fn target_filesearch(&self, kind: PathKind) -> filesearch::FileSearch<'_> {
@@ -846,8 +772,7 @@ impl Session {
             &self.sysroot,
             self.opts.target_triple.triple(),
             &self.opts.search_paths,
-            // `target_tlib_path == None` means it's the same as `host_tlib_path`.
-            self.target_tlib_path.as_ref().unwrap_or(&self.host_tlib_path),
+            &self.target_tlib_path,
             kind,
         )
     }
@@ -859,6 +784,18 @@ impl Session {
             &self.host_tlib_path,
             kind,
         )
+    }
+
+    /// Returns a list of directories where target-specific tool binaries are located.
+    pub fn get_tools_search_paths(&self, self_contained: bool) -> Vec<PathBuf> {
+        let rustlib_path = rustc_target::target_rustlib_path(&self.sysroot, &config::host_triple());
+        let p = std::array::IntoIter::new([
+            Path::new(&self.sysroot),
+            Path::new(&rustlib_path),
+            Path::new("bin"),
+        ])
+        .collect::<PathBuf>();
+        if self_contained { vec![p.clone(), p.join("self-contained")] } else { vec![p] }
     }
 
     pub fn init_incr_comp_session(
@@ -945,20 +882,25 @@ impl Session {
     /// This expends fuel if applicable, and records fuel if applicable.
     pub fn consider_optimizing<T: Fn() -> String>(&self, crate_name: &str, msg: T) -> bool {
         let mut ret = true;
-        if let Some(ref c) = self.optimization_fuel_crate {
+        if let Some((ref c, _)) = self.opts.debugging_opts.fuel {
             if c == crate_name {
                 assert_eq!(self.threads(), 1);
                 let mut fuel = self.optimization_fuel.lock();
                 ret = fuel.remaining != 0;
                 if fuel.remaining == 0 && !fuel.out_of_fuel {
-                    self.warn(&format!("optimization-fuel-exhausted: {}", msg()));
+                    if self.diagnostic().can_emit_warnings() {
+                        // We only call `msg` in case we can actually emit warnings.
+                        // Otherwise, this could cause a `delay_good_path_bug` to
+                        // trigger (issue #79546).
+                        self.warn(&format!("optimization-fuel-exhausted: {}", msg()));
+                    }
                     fuel.out_of_fuel = true;
                 } else if fuel.remaining > 0 {
                     fuel.remaining -= 1;
                 }
             }
         }
-        if let Some(ref c) = self.print_fuel_crate {
+        if let Some(ref c) = self.opts.debugging_opts.print_fuel {
             if c == crate_name {
                 assert_eq!(self.threads(), 1);
                 self.print_fuel.fetch_add(1, SeqCst);
@@ -1113,47 +1055,14 @@ impl Session {
             == config::InstrumentCoverage::ExceptUnusedFunctions
     }
 
-    pub fn mark_attr_known(&self, attr: &Attribute) {
-        self.known_attrs.lock().mark(attr)
-    }
-
-    pub fn is_attr_known(&self, attr: &Attribute) -> bool {
-        self.known_attrs.lock().is_marked(attr)
-    }
-
-    pub fn mark_attr_used(&self, attr: &Attribute) {
-        self.used_attrs.lock().mark(attr)
-    }
-
-    pub fn is_attr_used(&self, attr: &Attribute) -> bool {
-        self.used_attrs.lock().is_marked(attr)
-    }
-
-    /// Returns `true` if the attribute's path matches the argument. If it
-    /// matches, then the attribute is marked as used.
-    ///
-    /// This method should only be used by rustc, other tools can use
-    /// `Attribute::has_name` instead, because only rustc is supposed to report
-    /// the `unused_attributes` lint. (`MetaItem` and `NestedMetaItem` are
-    /// produced by lowering an `Attribute` and don't have identity, so they
-    /// only have the `has_name` method, and you need to mark the original
-    /// `Attribute` as used when necessary.)
-    pub fn check_name(&self, attr: &Attribute, name: Symbol) -> bool {
-        let matches = attr.has_name(name);
-        if matches {
-            self.mark_attr_used(attr);
-        }
-        matches
-    }
-
     pub fn is_proc_macro_attr(&self, attr: &Attribute) -> bool {
         [sym::proc_macro, sym::proc_macro_attribute, sym::proc_macro_derive]
             .iter()
-            .any(|kind| self.check_name(attr, *kind))
+            .any(|kind| attr.has_name(*kind))
     }
 
     pub fn contains_name(&self, attrs: &[Attribute], name: Symbol) -> bool {
-        attrs.iter().any(|item| self.check_name(item, name))
+        attrs.iter().any(|item| item.has_name(name))
     }
 
     pub fn find_by_name<'a>(
@@ -1161,7 +1070,7 @@ impl Session {
         attrs: &'a [Attribute],
         name: Symbol,
     ) -> Option<&'a Attribute> {
-        attrs.iter().find(|attr| self.check_name(attr, name))
+        attrs.iter().find(|attr| attr.has_name(name))
     }
 
     pub fn filter_by_name<'a>(
@@ -1169,7 +1078,7 @@ impl Session {
         attrs: &'a [Attribute],
         name: Symbol,
     ) -> impl Iterator<Item = &'a Attribute> {
-        attrs.iter().filter(move |attr| self.check_name(attr, name))
+        attrs.iter().filter(move |attr| attr.has_name(name))
     }
 
     pub fn first_attr_value_str_by_name(
@@ -1177,7 +1086,7 @@ impl Session {
         attrs: &[Attribute],
         name: Symbol,
     ) -> Option<Symbol> {
-        attrs.iter().find(|at| self.check_name(at, name)).and_then(|at| at.value_str())
+        attrs.iter().find(|at| at.has_name(name)).and_then(|at| at.value_str())
     }
 }
 
@@ -1284,9 +1193,12 @@ pub fn build_session(
 
     let target_cfg = config::build_target_config(&sopts, target_override, &sysroot);
     let host_triple = TargetTriple::from_triple(config::host_triple());
-    let host = Target::search(&host_triple, &sysroot).unwrap_or_else(|e| {
+    let (host, target_warnings) = Target::search(&host_triple, &sysroot).unwrap_or_else(|e| {
         early_error(sopts.error_format, &format!("Error loading host specification: {}", e))
     });
+    for warning in target_warnings.warning_messages() {
+        early_warn(sopts.error_format, &warning)
+    }
 
     let loader = file_loader.unwrap_or_else(|| Box::new(RealFileLoader));
     let hash_kind = sopts.debugging_opts.src_hash_algorithm.unwrap_or_else(|| {
@@ -1334,11 +1246,13 @@ pub fn build_session(
 
     let host_triple = config::host_triple();
     let target_triple = sopts.target_triple.triple();
-    let host_tlib_path = SearchPath::from_sysroot_and_triple(&sysroot, host_triple);
+    let host_tlib_path = Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, host_triple));
     let target_tlib_path = if host_triple == target_triple {
-        None
+        // Use the same `SearchPath` if host and target triple are identical to avoid unnecessary
+        // rescanning of the target lib path and an unnecessary allocation.
+        host_tlib_path.clone()
     } else {
-        Some(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
+        Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
     };
 
     let file_path_mapping = sopts.file_path_mapping();
@@ -1346,23 +1260,11 @@ pub fn build_session(
     let local_crate_source_file =
         local_crate_source_file.map(|path| file_path_mapping.map_prefix(path).0);
 
-    let optimization_fuel_crate = sopts.debugging_opts.fuel.as_ref().map(|i| i.0.clone());
     let optimization_fuel = Lock::new(OptimizationFuel {
         remaining: sopts.debugging_opts.fuel.as_ref().map_or(0, |i| i.1),
         out_of_fuel: false,
     });
-    let print_fuel_crate = sopts.debugging_opts.print_fuel.clone();
     let print_fuel = AtomicU64::new(0);
-
-    let working_dir = env::current_dir().unwrap_or_else(|e| {
-        parse_sess.span_diagnostic.fatal(&format!("Current directory is invalid: {}", e)).raise()
-    });
-    let (path, remapped) = file_path_mapping.map_prefix(working_dir.clone());
-    let working_dir = if remapped {
-        RealFileName::Remapped { local_path: Some(working_dir), virtual_name: path }
-    } else {
-        RealFileName::LocalPath(path)
-    };
 
     let cgu_reuse_tracker = if sopts.debugging_opts.query_dep_graph {
         CguReuseTracker::new()
@@ -1394,16 +1296,10 @@ pub fn build_session(
         parse_sess,
         sysroot,
         local_crate_source_file,
-        working_dir,
         one_time_diagnostics: Default::default(),
         crate_types: OnceCell::new(),
-        crate_disambiguator: OnceCell::new(),
+        stable_crate_id: OnceCell::new(),
         features: OnceCell::new(),
-        lint_store: OnceCell::new(),
-        recursion_limit: OnceCell::new(),
-        move_size_limit: OnceCell::new(),
-        type_length_limit: OnceCell::new(),
-        const_eval_limit: OnceCell::new(),
         incr_comp_session: OneThread::new(RefCell::new(IncrCompSession::NotInitialized)),
         cgu_reuse_tracker,
         prof,
@@ -1414,22 +1310,14 @@ pub fn build_session(
             normalize_projection_ty: AtomicUsize::new(0),
         },
         code_stats: Default::default(),
-        optimization_fuel_crate,
         optimization_fuel,
-        print_fuel_crate,
         print_fuel,
         jobserver: jobserver::client(),
         driver_lint_caps,
-        trait_methods_not_found: Lock::new(Default::default()),
-        confused_type_with_std_module: Lock::new(Default::default()),
-        system_library_path: OneThread::new(RefCell::new(Default::default())),
         ctfe_backtrace,
         miri_unleashed_features: Lock::new(Default::default()),
         asm_arch,
         target_features: FxHashSet::default(),
-        known_attrs: Lock::new(MarkedAttrs::new()),
-        used_attrs: Lock::new(MarkedAttrs::new()),
-        if_let_suggestions: Default::default(),
     };
 
     validate_commandline_args_with_session_available(&sess);
@@ -1468,6 +1356,16 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         }
     }
 
+    // Do the same for sample profile data.
+    if let Some(ref path) = sess.opts.debugging_opts.profile_sample_use {
+        if !path.exists() {
+            sess.err(&format!(
+                "File `{}` passed to `-C profile-sample-use` does not exist.",
+                path.display()
+            ));
+        }
+    }
+
     // Unwind tables cannot be disabled if the target requires them.
     if let Some(include_uwtables) = sess.opts.cg.force_unwind_tables {
         if sess.target.requires_uwtable && !include_uwtables {
@@ -1476,25 +1374,6 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
                      `-C force-unwind-tables=no`.",
             );
         }
-    }
-
-    // PGO does not work reliably with panic=unwind on Windows. Let's make it
-    // an error to combine the two for now. It always runs into an assertions
-    // if LLVM is built with assertions, but without assertions it sometimes
-    // does not crash and will probably generate a corrupted binary.
-    // We should only display this error if we're actually going to run PGO.
-    // If we're just supposed to print out some data, don't show the error (#61002).
-    if sess.opts.cg.profile_generate.enabled()
-        && sess.target.is_like_msvc
-        && sess.panic_strategy() == PanicStrategy::Unwind
-        && sess.opts.prints.iter().all(|&p| p == PrintRequest::NativeStaticLibs)
-    {
-        sess.err(
-            "Profile-guided optimization does not yet work in conjunction \
-                  with `-Cpanic=unwind` on Windows when targeting MSVC. \
-                  See issue #61002 <https://github.com/rust-lang/rust/issues/61002> \
-                  for more information.",
-        );
     }
 
     // Sanitizers can only be used on platforms that we know have working sanitizer codegen.
@@ -1518,9 +1397,19 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     // Cannot enable crt-static with sanitizers on Linux
     if sess.crt_static(None) && !sess.opts.debugging_opts.sanitizer.is_empty() {
         sess.err(
-            "Sanitizer is incompatible with statically linked libc, \
+            "sanitizer is incompatible with statically linked libc, \
                                 disable it using `-C target-feature=-crt-static`",
         );
+    }
+
+    // LLVM CFI requires LTO.
+    if sess.is_sanitizer_cfi_enabled() {
+        if sess.opts.cg.lto == config::LtoCli::Unspecified
+            || sess.opts.cg.lto == config::LtoCli::No
+            || sess.opts.cg.lto == config::LtoCli::Thin
+        {
+            sess.err("`-Zsanitizer=cfi` requires `-Clto`");
+        }
     }
 }
 

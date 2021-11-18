@@ -13,7 +13,7 @@ use super::{
     formatters::{JsonFormatter, JunitFormatter, OutputFormatter, PrettyFormatter, TerseFormatter},
     helpers::{concurrency::get_concurrency, metrics::MetricMap},
     options::{Options, OutputFormat},
-    run_tests,
+    run_tests, term,
     test_result::TestResult,
     time::{TestExecTime, TestSuiteExecTime},
     types::{NamePadding, TestDesc, TestDescAndFn},
@@ -225,9 +225,9 @@ fn on_test_event(
     out: &mut dyn OutputFormatter,
 ) -> io::Result<()> {
     match (*event).clone() {
-        TestEvent::TeFiltered(ref filtered_tests) => {
+        TestEvent::TeFiltered(ref filtered_tests, shuffle_seed) => {
             st.total = filtered_tests.len();
-            out.write_run_start(filtered_tests.len())?;
+            out.write_run_start(filtered_tests.len(), shuffle_seed)?;
         }
         TestEvent::TeFilteredOut(filtered_out) => {
             st.filtered_out = filtered_out;

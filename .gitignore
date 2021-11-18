@@ -69,7 +69,10 @@ __pycache__/
 *$py.class
 
 ## Node
-**node_modules
-**package-lock.json
+node_modules
+package-lock.json
+
+## Rustdoc GUI tests
+src/test/rustdoc-gui/src/**.lock
 
 # Before adding new lines, see the comment at the top.

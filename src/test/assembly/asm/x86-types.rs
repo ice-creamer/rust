@@ -1,12 +1,13 @@
-// min-llvm-version: 10.0.1
 // revisions: x86_64 i686
 // assembly-output: emit-asm
 //[x86_64] compile-flags: --target x86_64-unknown-linux-gnu
+//[x86_64] needs-llvm-components: x86
 //[i686] compile-flags: --target i686-unknown-linux-gnu
+//[i686] needs-llvm-components: x86
 // compile-flags: -C llvm-args=--x86-asm-syntax=intel
 // compile-flags: -C target-feature=+avx512bw
 
-#![feature(no_core, lang_items, rustc_attrs, repr_simd)]
+#![feature(no_core, lang_items, rustc_attrs, repr_simd, asm_sym)]
 #![crate_type = "rlib"]
 #![no_core]
 #![allow(asm_sub_register, non_camel_case_types)]

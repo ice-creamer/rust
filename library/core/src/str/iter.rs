@@ -2,9 +2,9 @@
 
 use crate::char;
 use crate::fmt::{self, Write};
-use crate::iter::TrustedRandomAccess;
 use crate::iter::{Chain, FlatMap, Flatten};
 use crate::iter::{Copied, Filter, FusedIterator, Map, TrustedLen};
+use crate::iter::{TrustedRandomAccess, TrustedRandomAccessNoCoerce};
 use crate::ops::Try;
 use crate::option;
 use crate::slice::{self, Split as SliceSplit};
@@ -27,6 +27,7 @@ use super::{IsAsciiWhitespace, IsNotEmpty, IsWhitespace};
 /// [`char`]: prim@char
 /// [`chars`]: str::chars
 #[derive(Clone)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Chars<'a> {
     pub(super) iter: slice::Iter<'a, u8>,
@@ -109,6 +110,7 @@ impl<'a> Chars<'a> {
     /// assert_eq!(chars.as_str(), "");
     /// ```
     #[stable(feature = "iter_to_slice", since = "1.4.0")]
+    #[must_use]
     #[inline]
     pub fn as_str(&self) -> &'a str {
         // SAFETY: `Chars` is only made from a str, which guarantees the iter is valid UTF-8.
@@ -124,6 +126,7 @@ impl<'a> Chars<'a> {
 /// [`char`]: prim@char
 /// [`char_indices`]: str::char_indices
 #[derive(Clone, Debug)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct CharIndices<'a> {
     pub(super) front_offset: usize,
@@ -185,6 +188,7 @@ impl<'a> CharIndices<'a> {
     /// This has the same lifetime as the original slice, and so the
     /// iterator can continue to be used while this exists.
     #[stable(feature = "iter_to_slice", since = "1.4.0")]
+    #[must_use]
     #[inline]
     pub fn as_str(&self) -> &'a str {
         self.iter.as_str()
@@ -209,6 +213,7 @@ impl<'a> CharIndices<'a> {
     /// assert_eq!(chars.next(), None);
     /// ```
     #[inline]
+    #[must_use]
     #[unstable(feature = "char_indices_offset", issue = "83871")]
     pub fn offset(&self) -> usize {
         self.front_offset
@@ -221,6 +226,7 @@ impl<'a> CharIndices<'a> {
 /// See its documentation for more.
 ///
 /// [`bytes`]: str::bytes
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone, Debug)]
 pub struct Bytes<'a>(pub(super) Copied<slice::Iter<'a, u8>>);
@@ -295,6 +301,7 @@ impl Iterator for Bytes<'_> {
     }
 
     #[inline]
+    #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> u8 {
         // SAFETY: the caller must uphold the safety contract
         // for `Iterator::__iterator_get_unchecked`.
@@ -344,7 +351,11 @@ unsafe impl TrustedLen for Bytes<'_> {}
 
 #[doc(hidden)]
 #[unstable(feature = "trusted_random_access", issue = "none")]
-unsafe impl TrustedRandomAccess for Bytes<'_> {
+unsafe impl TrustedRandomAccess for Bytes<'_> {}
+
+#[doc(hidden)]
+#[unstable(feature = "trusted_random_access", issue = "none")]
+unsafe impl TrustedRandomAccessNoCoerce for Bytes<'_> {
     const MAY_HAVE_SIDE_EFFECT: bool = false;
 }
 
@@ -1082,6 +1093,7 @@ generate_pattern_iterators! {
 ///
 /// [`lines`]: str::lines
 #[stable(feature = "rust1", since = "1.0.0")]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[derive(Clone, Debug)]
 pub struct Lines<'a>(pub(super) Map<SplitTerminator<'a, char>, LinesAnyMap>);
 
@@ -1121,6 +1133,7 @@ impl FusedIterator for Lines<'_> {}
 /// [`lines_any`]: str::lines_any
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_deprecated(since = "1.4.0", reason = "use lines()/Lines instead now")]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[derive(Clone, Debug)]
 #[allow(deprecated)]
 pub struct LinesAny<'a>(pub(super) Lines<'a>);
@@ -1242,6 +1255,7 @@ impl<'a> SplitWhitespace<'a> {
     /// assert_eq!(split.as_str(), "");
     /// ```
     #[inline]
+    #[must_use]
     #[unstable(feature = "str_split_whitespace_as_str", issue = "77998")]
     pub fn as_str(&self) -> &'a str {
         self.inner.iter.as_str()
@@ -1297,6 +1311,7 @@ impl<'a> SplitAsciiWhitespace<'a> {
     /// assert_eq!(split.as_str(), "");
     /// ```
     #[inline]
+    #[must_use]
     #[unstable(feature = "str_split_whitespace_as_str", issue = "77998")]
     pub fn as_str(&self) -> &'a str {
         if self.inner.iter.iter.finished {

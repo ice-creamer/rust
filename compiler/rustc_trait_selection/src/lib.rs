@@ -17,6 +17,7 @@
 #![feature(hash_drain_filter)]
 #![feature(in_band_lifetimes)]
 #![feature(iter_zip)]
+#![feature(let_else)]
 #![feature(never_type)]
 #![feature(crate_visibility_modifier)]
 #![feature(control_flow_enum)]
@@ -31,6 +32,8 @@ extern crate rustc_data_structures;
 extern crate tracing;
 #[macro_use]
 extern crate rustc_middle;
+#[macro_use]
+extern crate smallvec;
 
 pub mod autoderef;
 pub mod infer;

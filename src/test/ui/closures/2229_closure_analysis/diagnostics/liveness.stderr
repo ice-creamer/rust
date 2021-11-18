@@ -1,14 +1,5 @@
-warning: the feature `capture_disjoint_fields` is incomplete and may not be safe to use and/or cause compiler crashes
-  --> $DIR/liveness.rs:2:12
-   |
-LL | #![feature(capture_disjoint_fields)]
-   |            ^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: `#[warn(incomplete_features)]` on by default
-   = note: see issue #53488 <https://github.com/rust-lang/rust/issues/53488> for more information
-
 warning: value captured by `a` is never read
-  --> $DIR/liveness.rs:23:9
+  --> $DIR/liveness.rs:24:9
    |
 LL |         a = 1;
    |         ^
@@ -22,7 +13,7 @@ LL | #![warn(unused)]
    = help: did you mean to capture by reference instead?
 
 warning: unused variable: `a`
-  --> $DIR/liveness.rs:32:9
+  --> $DIR/liveness.rs:33:9
    |
 LL |         a += 1;
    |         ^
@@ -36,7 +27,7 @@ LL | #![warn(unused)]
    = help: did you mean to capture by reference instead?
 
 warning: value assigned to `a` is never read
-  --> $DIR/liveness.rs:52:9
+  --> $DIR/liveness.rs:53:9
    |
 LL |         a += 1;
    |         ^
@@ -44,7 +35,7 @@ LL |         a += 1;
    = help: maybe it is overwritten before being read?
 
 warning: value assigned to `a` is never read
-  --> $DIR/liveness.rs:76:13
+  --> $DIR/liveness.rs:77:13
    |
 LL |             a = Some("d1");
    |             ^
@@ -52,7 +43,7 @@ LL |             a = Some("d1");
    = help: maybe it is overwritten before being read?
 
 warning: value assigned to `b` is never read
-  --> $DIR/liveness.rs:84:13
+  --> $DIR/liveness.rs:85:13
    |
 LL |             b = Some("e1");
    |             ^
@@ -60,7 +51,7 @@ LL |             b = Some("e1");
    = help: maybe it is overwritten before being read?
 
 warning: value assigned to `b` is never read
-  --> $DIR/liveness.rs:86:13
+  --> $DIR/liveness.rs:87:13
    |
 LL |             b = Some("e2");
    |             ^
@@ -68,12 +59,12 @@ LL |             b = Some("e2");
    = help: maybe it is overwritten before being read?
 
 warning: unused variable: `b`
-  --> $DIR/liveness.rs:84:13
+  --> $DIR/liveness.rs:85:13
    |
 LL |             b = Some("e1");
    |             ^
    |
    = help: did you mean to capture by reference instead?
 
-warning: 8 warnings emitted
+warning: 7 warnings emitted
 

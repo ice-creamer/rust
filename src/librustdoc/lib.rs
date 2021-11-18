@@ -4,9 +4,12 @@
 )]
 #![feature(rustc_private)]
 #![feature(array_methods)]
+#![feature(assert_matches)]
 #![feature(box_patterns)]
+#![feature(control_flow_enum)]
 #![feature(box_syntax)]
 #![feature(in_band_lifetimes)]
+#![feature(let_else)]
 #![feature(nll)]
 #![feature(test)]
 #![feature(crate_visibility_modifier)]
@@ -17,8 +20,6 @@
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
 
-#[macro_use]
-extern crate lazy_static;
 #[macro_use]
 extern crate tracing;
 
@@ -34,6 +35,7 @@ extern crate rustc_ast;
 extern crate rustc_ast_lowering;
 extern crate rustc_ast_pretty;
 extern crate rustc_attr;
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
@@ -47,18 +49,19 @@ extern crate rustc_interface;
 extern crate rustc_lexer;
 extern crate rustc_lint;
 extern crate rustc_lint_defs;
+extern crate rustc_macros;
 extern crate rustc_metadata;
 extern crate rustc_middle;
-extern crate rustc_mir;
 extern crate rustc_parse;
 extern crate rustc_passes;
 extern crate rustc_resolve;
+extern crate rustc_serialize;
 extern crate rustc_session;
-extern crate rustc_span as rustc_span;
+extern crate rustc_span;
 extern crate rustc_target;
 extern crate rustc_trait_selection;
 extern crate rustc_typeck;
-extern crate test as testing;
+extern crate test;
 
 #[cfg(feature = "jemalloc")]
 extern crate tikv_jemalloc_sys;
@@ -101,17 +104,13 @@ macro_rules! map {
     }}
 }
 
-#[macro_use]
-mod externalfiles;
-
 mod clean;
 mod config;
 mod core;
 mod docfs;
-mod doctree;
-#[macro_use]
-mod error;
 mod doctest;
+mod error;
+mod externalfiles;
 mod fold;
 mod formats;
 // used by the error-index generator, so it needs to be public
@@ -120,7 +119,9 @@ mod json;
 crate mod lint;
 mod markdown;
 mod passes;
+mod scrape_examples;
 mod theme;
+mod visit;
 mod visit_ast;
 mod visit_lib;
 
@@ -270,9 +271,9 @@ fn opts() -> Vec<RustcOptGroup> {
     let stable: fn(_, fn(&mut getopts::Options) -> &mut _) -> _ = RustcOptGroup::stable;
     let unstable: fn(_, fn(&mut getopts::Options) -> &mut _) -> _ = RustcOptGroup::unstable;
     vec![
-        stable("h", |o| o.optflag("h", "help", "show this help message")),
-        stable("V", |o| o.optflag("V", "version", "print rustdoc's version")),
-        stable("v", |o| o.optflag("v", "verbose", "use verbose output")),
+        stable("h", |o| o.optflagmulti("h", "help", "show this help message")),
+        stable("V", |o| o.optflagmulti("V", "version", "print rustdoc's version")),
+        stable("v", |o| o.optflagmulti("v", "verbose", "use verbose output")),
         stable("r", |o| {
             o.optopt("r", "input-format", "the input type of the specified file", "[rust]")
         }),
@@ -296,6 +297,13 @@ fn opts() -> Vec<RustcOptGroup> {
                 "NAME=URL",
             )
         }),
+        unstable("extern-html-root-takes-precedence", |o| {
+            o.optflagmulti(
+                "",
+                "extern-html-root-takes-precedence",
+                "give precedence to `--extern-html-root-url`, not `html_root_url`",
+            )
+        }),
         stable("plugin-path", |o| o.optmulti("", "plugin-path", "removed", "DIR")),
         stable("C", |o| {
             o.optmulti("C", "codegen", "pass a codegen option to rustc", "OPT[=VALUE]")
@@ -310,14 +318,14 @@ fn opts() -> Vec<RustcOptGroup> {
             )
         }),
         stable("plugins", |o| o.optmulti("", "plugins", "removed", "PLUGINS")),
-        stable("no-default", |o| o.optflag("", "no-defaults", "don't run the default passes")),
+        stable("no-default", |o| o.optflagmulti("", "no-defaults", "don't run the default passes")),
         stable("document-private-items", |o| {
-            o.optflag("", "document-private-items", "document private items")
+            o.optflagmulti("", "document-private-items", "document private items")
         }),
         unstable("document-hidden-items", |o| {
-            o.optflag("", "document-hidden-items", "document items that have doc(hidden)")
+            o.optflagmulti("", "document-hidden-items", "document items that have doc(hidden)")
         }),
-        stable("test", |o| o.optflag("", "test", "run code examples as tests")),
+        stable("test", |o| o.optflagmulti("", "test", "run code examples as tests")),
         stable("test-args", |o| {
             o.optmulti("", "test-args", "arguments to pass to the test runner", "ARGS")
         }),
@@ -387,7 +395,7 @@ fn opts() -> Vec<RustcOptGroup> {
             o.optopt("", "markdown-playground-url", "URL to send code snippets to", "URL")
         }),
         stable("markdown-no-toc", |o| {
-            o.optflag("", "markdown-no-toc", "don't include table of contents")
+            o.optflagmulti("", "markdown-no-toc", "don't include table of contents")
         }),
         stable("e", |o| {
             o.optopt(
@@ -412,14 +420,18 @@ fn opts() -> Vec<RustcOptGroup> {
                 "URL",
             )
         }),
-        unstable("display-warnings", |o| {
-            o.optflag("", "display-warnings", "to print code warnings when testing doc")
+        unstable("display-doctest-warnings", |o| {
+            o.optflagmulti(
+                "",
+                "display-doctest-warnings",
+                "show warnings that originate in doctests",
+            )
         }),
         stable("crate-version", |o| {
             o.optopt("", "crate-version", "crate version to print into documentation", "VERSION")
         }),
         unstable("sort-modules-by-appearance", |o| {
-            o.optflag(
+            o.optflagmulti(
                 "",
                 "sort-modules-by-appearance",
                 "sort modules by where they appear in the program, rather than alphabetically",
@@ -496,12 +508,13 @@ fn opts() -> Vec<RustcOptGroup> {
             o.optopt("", "json", "Configure the structure of JSON diagnostics", "CONFIG")
         }),
         unstable("disable-minification", |o| {
-            o.optflag("", "disable-minification", "Disable minification applied on JS files")
+            o.optflagmulti("", "disable-minification", "Disable minification applied on JS files")
         }),
-        stable("warn", |o| o.optmulti("W", "warn", "Set lint warnings", "OPT")),
-        stable("allow", |o| o.optmulti("A", "allow", "Set lint allowed", "OPT")),
-        stable("deny", |o| o.optmulti("D", "deny", "Set lint denied", "OPT")),
-        stable("forbid", |o| o.optmulti("F", "forbid", "Set lint forbidden", "OPT")),
+        stable("allow", |o| o.optmulti("A", "allow", "Set lint allowed", "LINT")),
+        stable("warn", |o| o.optmulti("W", "warn", "Set lint warnings", "LINT")),
+        stable("force-warn", |o| o.optmulti("", "force-warn", "Set lint force-warn", "LINT")),
+        stable("deny", |o| o.optmulti("D", "deny", "Set lint denied", "LINT")),
+        stable("forbid", |o| o.optmulti("F", "forbid", "Set lint forbidden", "LINT")),
         stable("cap-lints", |o| {
             o.optmulti(
                 "",
@@ -512,19 +525,11 @@ fn opts() -> Vec<RustcOptGroup> {
                 "LEVEL",
             )
         }),
-        unstable("force-warns", |o| {
-            o.optopt(
-                "",
-                "force-warns",
-                "Lints that will warn even if allowed somewhere else",
-                "LINTS",
-            )
-        }),
         unstable("index-page", |o| {
             o.optopt("", "index-page", "Markdown file to be used as index page", "PATH")
         }),
         unstable("enable-index-page", |o| {
-            o.optflag("", "enable-index-page", "To enable generation of the index page")
+            o.optflagmulti("", "enable-index-page", "To enable generation of the index page")
         }),
         unstable("static-root-path", |o| {
             o.optopt(
@@ -536,7 +541,7 @@ fn opts() -> Vec<RustcOptGroup> {
             )
         }),
         unstable("disable-per-crate-search", |o| {
-            o.optflag(
+            o.optflagmulti(
                 "",
                 "disable-per-crate-search",
                 "disables generating the crate selector on the search box",
@@ -551,14 +556,14 @@ fn opts() -> Vec<RustcOptGroup> {
             )
         }),
         unstable("show-coverage", |o| {
-            o.optflag(
+            o.optflagmulti(
                 "",
                 "show-coverage",
                 "calculate percentage of public items with documentation",
             )
         }),
         unstable("enable-per-target-ignores", |o| {
-            o.optflag(
+            o.optflagmulti(
                 "",
                 "enable-per-target-ignores",
                 "parse ignore-foo for ignoring doctests on a per-target basis",
@@ -583,9 +588,9 @@ fn opts() -> Vec<RustcOptGroup> {
         unstable("test-builder", |o| {
             o.optopt("", "test-builder", "The rustc-like binary to use as the test builder", "PATH")
         }),
-        unstable("check", |o| o.optflag("", "check", "Run rustdoc checks")),
+        unstable("check", |o| o.optflagmulti("", "check", "Run rustdoc checks")),
         unstable("generate-redirect-map", |o| {
-            o.optflag(
+            o.optflagmulti(
                 "",
                 "generate-redirect-map",
                 "Generate JSON file at the top level instead of generating HTML redirection files",
@@ -599,9 +604,45 @@ fn opts() -> Vec<RustcOptGroup> {
                 "[unversioned-shared-resources,toolchain-shared-resources,invocation-specific]",
             )
         }),
-        unstable("no-run", |o| o.optflag("", "no-run", "Compile doctests without running them")),
+        unstable("no-run", |o| {
+            o.optflagmulti("", "no-run", "Compile doctests without running them")
+        }),
         unstable("show-type-layout", |o| {
-            o.optflag("", "show-type-layout", "Include the memory layout of types in the docs")
+            o.optflagmulti("", "show-type-layout", "Include the memory layout of types in the docs")
+        }),
+        unstable("nocapture", |o| {
+            o.optflag("", "nocapture", "Don't capture stdout and stderr of tests")
+        }),
+        unstable("generate-link-to-definition", |o| {
+            o.optflag(
+                "",
+                "generate-link-to-definition",
+                "Make the identifiers in the HTML source code pages navigable",
+            )
+        }),
+        unstable("scrape-examples-output-path", |o| {
+            o.optopt(
+                "",
+                "scrape-examples-output-path",
+                "",
+                "collect function call information and output at the given path",
+            )
+        }),
+        unstable("scrape-examples-target-crate", |o| {
+            o.optmulti(
+                "",
+                "scrape-examples-target-crate",
+                "",
+                "collect function call information for functions from the target crate",
+            )
+        }),
+        unstable("with-examples", |o| {
+            o.optmulti(
+                "",
+                "with-examples",
+                "",
+                "path to function call information (for displaying examples in the documentation)",
+            )
         }),
     ]
 }
@@ -714,8 +755,10 @@ fn main_options(options: config::Options) -> MainResult {
     let default_passes = options.default_passes;
     let output_format = options.output_format;
     // FIXME: fix this clone (especially render_options)
+    let externs = options.externs.clone();
     let manual_passes = options.manual_passes.clone();
     let render_options = options.render_options.clone();
+    let scrape_examples_options = options.scrape_examples_options.clone();
     let config = core::create_config(options);
 
     interface::create_compiler_and_run(config, |compiler| {
@@ -731,9 +774,9 @@ fn main_options(options: config::Options) -> MainResult {
             // We need to hold on to the complete resolver, so we cause everything to be
             // cloned for the analysis passes to use. Suboptimal, but necessary in the
             // current architecture.
-            let resolver = core::create_resolver(queries, &sess);
+            let resolver = core::create_resolver(externs, queries, sess);
 
-            if sess.has_errors() {
+            if sess.diagnostic().has_errors_or_lint_errors() {
                 sess.fatal("Compilation failed, aborting rustdoc");
             }
 
@@ -751,6 +794,10 @@ fn main_options(options: config::Options) -> MainResult {
                     )
                 });
                 info!("finished with rustc");
+
+                if let Some(options) = scrape_examples_options {
+                    return scrape_examples::run(krate, render_opts, cache, tcx, options);
+                }
 
                 cache.crate_version = crate_version;
 

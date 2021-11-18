@@ -1,12 +1,10 @@
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_hir as hir;
-use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LOCAL_CRATE};
-use rustc_middle::hir::map as hir_map;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::{
     self, Binder, Predicate, PredicateKind, ToPredicate, Ty, TyCtxt, WithConstness,
 };
-use rustc_session::CrateDisambiguator;
 use rustc_span::Span;
 use rustc_trait_selection::traits;
 
@@ -101,7 +99,7 @@ fn associated_item_from_trait_item_ref(
 fn associated_item_from_impl_item_ref(
     tcx: TyCtxt<'_>,
     parent_def_id: LocalDefId,
-    impl_item_ref: &hir::ImplItemRef<'_>,
+    impl_item_ref: &hir::ImplItemRef,
 ) -> ty::AssocItem {
     let def_id = impl_item_ref.id.def_id;
     let (kind, has_self) = match impl_item_ref.kind {
@@ -169,6 +167,16 @@ fn impl_defaultness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Defaultness {
     }
 }
 
+fn impl_constness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Constness {
+    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
+    let item = tcx.hir().expect_item(hir_id);
+    if let hir::ItemKind::Impl(impl_) = &item.kind {
+        impl_.constness
+    } else {
+        bug!("`impl_constness` called on {:?}", item);
+    }
+}
+
 /// Calculates the `Sized` constraint.
 ///
 /// In fact, there are only a few options for the types in the constraint:
@@ -176,7 +184,7 @@ fn impl_defaultness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Defaultness {
 ///     - a type parameter or projection whose Sizedness can't be known
 ///     - a tuple of type parameters or projections, if there are multiple
 ///       such.
-///     - a Error, if a type contained itself. The representability
+///     - an Error, if a type contained itself. The representability
 ///       check should catch this case.
 fn adt_sized_constraint(tcx: TyCtxt<'_>, def_id: DefId) -> ty::AdtSizedConstraint<'_> {
     let def = tcx.adt_def(def_id);
@@ -214,7 +222,18 @@ fn associated_items(tcx: TyCtxt<'_>, def_id: DefId) -> ty::AssocItems<'_> {
 }
 
 fn def_ident_span(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Span> {
-    tcx.hir().get_if_local(def_id).and_then(|node| node.ident()).map(|ident| ident.span)
+    tcx.hir()
+        .get_if_local(def_id)
+        .and_then(|node| match node {
+            // A `Ctor` doesn't have an identifier itself, but its parent
+            // struct/variant does. Compare with `hir::Map::opt_span`.
+            hir::Node::Ctor(ctor) => ctor
+                .ctor_hir_id()
+                .and_then(|ctor_id| tcx.hir().find(tcx.hir().get_parent_node(ctor_id)))
+                .and_then(|parent| parent.ident()),
+            _ => node.ident(),
+        })
+        .map(|ident| ident.span)
 }
 
 /// If the given `DefId` describes an item belonging to a trait,
@@ -228,6 +247,7 @@ fn trait_of_item(tcx: TyCtxt<'_>, def_id: DefId) -> Option<DefId> {
 }
 
 /// See `ParamEnv` struct definition for details.
+#[instrument(level = "debug", skip(tcx))]
 fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
     // The param_env of an impl Trait type is its defining function's param_env
     if let Some(parent) = ty::is_impl_trait_defn(tcx, def_id) {
@@ -244,7 +264,7 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
     // `<i32 as Foo>::Bar` where `i32` does not implement `Foo`. We
     // report these errors right here; this doesn't actually feel
     // right to me, because constructing the environment feels like a
-    // kind of a "idempotent" action, but I'm not sure where would be
+    // kind of an "idempotent" action, but I'm not sure where would be
     // a better place. In practice, we construct environments for
     // every fn once during type checking, and we'll abort if there
     // are any errors at that point, so after type checking you can be
@@ -255,9 +275,20 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
         predicates.extend(environment);
     }
 
+    // It's important that we include the default substs in unevaluated
+    // constants, since `Unevaluated` instances in predicates whose substs are None
+    // can lead to "duplicate" caller bounds candidates during trait selection,
+    // duplicate in the sense that both have their default substs, but the
+    // candidate that resulted from a superpredicate still uses `None` in its
+    // `substs_` field of `Unevaluated` to indicate that it has its default substs,
+    // whereas the other candidate has `substs_: Some(default_substs)`, see
+    // issue #89334
+    predicates = tcx.expose_default_const_substs(predicates);
+
     let unnormalized_env =
         ty::ParamEnv::new(tcx.intern_predicates(&predicates), traits::Reveal::UserFacing);
 
+    debug!("unnormalized_env caller bounds: {:?}", unnormalized_env.caller_bounds());
     let body_id = def_id
         .as_local()
         .map(|def_id| tcx.hir().local_def_id_to_hir_id(def_id))
@@ -352,7 +383,7 @@ fn well_formed_types_in_env<'tcx>(
         // constituents are well-formed.
         NodeKind::InherentImpl => {
             let self_ty = tcx.type_of(def_id);
-            inputs.extend(self_ty.walk());
+            inputs.extend(self_ty.walk(tcx));
         }
 
         // In an fn, we assume that the arguments and all their constituents are
@@ -361,7 +392,7 @@ fn well_formed_types_in_env<'tcx>(
             let fn_sig = tcx.fn_sig(def_id);
             let fn_sig = tcx.liberate_late_bound_regions(def_id, fn_sig);
 
-            inputs.extend(fn_sig.inputs().iter().flat_map(|ty| ty.walk()));
+            inputs.extend(fn_sig.inputs().iter().flat_map(|ty| ty.walk(tcx)));
         }
 
         NodeKind::Other => (),
@@ -388,11 +419,6 @@ fn param_env_reveal_all_normalized(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamE
     tcx.param_env(def_id).with_reveal_all_normalized(tcx)
 }
 
-fn crate_disambiguator(tcx: TyCtxt<'_>, crate_num: CrateNum) -> CrateDisambiguator {
-    assert_eq!(crate_num, LOCAL_CRATE);
-    tcx.sess.local_crate_disambiguator()
-}
-
 fn instance_def_size_estimate<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance_def: ty::InstanceDef<'tcx>,
@@ -402,7 +428,7 @@ fn instance_def_size_estimate<'tcx>(
     match instance_def {
         InstanceDef::Item(..) | InstanceDef::DropGlue(..) => {
             let mir = tcx.instance_mir(instance_def);
-            mir.basic_blocks().iter().map(|bb| bb.statements.len()).sum()
+            mir.basic_blocks().iter().map(|bb| bb.statements.len() + 1).sum()
         }
         // Estimate the size of other compiler-generated shims to be 1.
         _ => 1,
@@ -463,11 +489,11 @@ fn asyncness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::IsAsync {
 
     let node = tcx.hir().get(hir_id);
 
-    let fn_like = hir_map::blocks::FnLikeNode::from_node(node).unwrap_or_else(|| {
+    let fn_kind = node.fn_kind().unwrap_or_else(|| {
         bug!("asyncness: expected fn-like node but got `{:?}`", def_id);
     });
 
-    fn_like.asyncness()
+    fn_kind.asyncness()
 }
 
 /// Don't call this directly: use ``tcx.conservative_is_privately_uninhabited`` instead.
@@ -538,10 +564,10 @@ pub fn provide(providers: &mut ty::query::Providers) {
         param_env,
         param_env_reveal_all_normalized,
         trait_of_item,
-        crate_disambiguator,
         instance_def_size_estimate,
         issue33140_self_ty,
         impl_defaultness,
+        impl_constness,
         conservative_is_privately_uninhabited: conservative_is_privately_uninhabited_raw,
         ..*providers
     };

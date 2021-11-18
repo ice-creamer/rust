@@ -5,8 +5,7 @@
 // aux-build:helper.rs
 
 #![warn(clippy::missing_const_for_fn)]
-#![allow(incomplete_features)]
-#![feature(start, const_generics)]
+#![feature(start)]
 #![feature(custom_inner_attributes)]
 
 extern crate helper;
@@ -84,7 +83,7 @@ mod with_drop {
 
     impl A {
         // This can not be const because the type implements `Drop`.
-        pub fn a(self) -> B {
+        pub fn b(self) -> B {
             B
         }
     }

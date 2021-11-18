@@ -108,6 +108,7 @@ use crate::intrinsics;
 // unsafe traits and unsafe methods (i.e., `type_id` would still be safe to call,
 // but we would likely want to indicate as such in documentation).
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Any")]
 pub trait Any: 'static {
     /// Gets the `TypeId` of `self`.
     ///
@@ -457,6 +458,7 @@ impl TypeId {
     /// assert_eq!(is_string(&0), false);
     /// assert_eq!(is_string(&"cookie monster".to_string()), true);
     /// ```
+    #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_unstable(feature = "const_type_id", issue = "77125")]
     pub const fn of<T: ?Sized + 'static>() -> TypeId {
@@ -491,6 +493,7 @@ impl TypeId {
 ///     "core::option::Option<alloc::string::String>",
 /// );
 /// ```
+#[must_use]
 #[stable(feature = "type_name", since = "1.38.0")]
 #[rustc_const_unstable(feature = "const_type_name", issue = "63084")]
 pub const fn type_name<T: ?Sized>() -> &'static str {
@@ -533,6 +536,7 @@ pub const fn type_name<T: ?Sized>() -> &'static str {
 /// let y = 1.0;
 /// println!("{}", type_name_of_val(&y));
 /// ```
+#[must_use]
 #[unstable(feature = "type_name_of_val", issue = "66359")]
 #[rustc_const_unstable(feature = "const_type_name", issue = "63084")]
 pub const fn type_name_of_val<T: ?Sized>(_val: &T) -> &'static str {

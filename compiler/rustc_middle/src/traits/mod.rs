@@ -9,14 +9,14 @@ pub mod specialization_graph;
 mod structural_impls;
 
 use crate::infer::canonical::Canonical;
-use crate::mir::abstract_const::NotConstEvaluatable;
+use crate::thir::abstract_const::NotConstEvaluatable;
 use crate::ty::subst::SubstsRef;
 use crate::ty::{self, AdtKind, Ty, TyCtxt};
 
+use rustc_data_structures::sync::Lrc;
 use rustc_errors::{Applicability, DiagnosticBuilder};
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
-use rustc_hir::Constness;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_span::symbol::Symbol;
 use rustc_span::{Span, DUMMY_SP};
 use smallvec::SmallVec;
@@ -24,7 +24,6 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::fmt;
 use std::ops::Deref;
-use std::rc::Rc;
 
 pub use self::select::{EvaluationCache, EvaluationResult, OverflowError, SelectionCache};
 
@@ -87,7 +86,7 @@ pub enum Reveal {
 #[derive(Clone, PartialEq, Eq, Hash, Lift)]
 pub struct ObligationCause<'tcx> {
     /// `None` for `ObligationCause::dummy`, `Some` otherwise.
-    data: Option<Rc<ObligationCauseData<'tcx>>>,
+    data: Option<Lrc<ObligationCauseData<'tcx>>>,
 }
 
 const DUMMY_OBLIGATION_CAUSE_DATA: ObligationCauseData<'static> =
@@ -131,7 +130,7 @@ impl<'tcx> ObligationCause<'tcx> {
         body_id: hir::HirId,
         code: ObligationCauseCode<'tcx>,
     ) -> ObligationCause<'tcx> {
-        ObligationCause { data: Some(Rc::new(ObligationCauseData { span, body_id, code })) }
+        ObligationCause { data: Some(Lrc::new(ObligationCauseData { span, body_id, code })) }
     }
 
     pub fn misc(span: Span, body_id: hir::HirId) -> ObligationCause<'tcx> {
@@ -148,7 +147,7 @@ impl<'tcx> ObligationCause<'tcx> {
     }
 
     pub fn make_mut(&mut self) -> &mut ObligationCauseData<'tcx> {
-        Rc::make_mut(self.data.get_or_insert_with(|| Rc::new(DUMMY_OBLIGATION_CAUSE_DATA)))
+        Lrc::make_mut(self.data.get_or_insert_with(|| Lrc::new(DUMMY_OBLIGATION_CAUSE_DATA)))
     }
 
     pub fn span(&self, tcx: TyCtxt<'tcx>) -> Span {
@@ -225,6 +224,8 @@ pub enum ObligationCauseCode<'tcx> {
     SizedReturnType,
     /// Yield type must be `Sized`.
     SizedYieldType,
+    /// Box expression result type must be `Sized`.
+    SizedBoxType,
     /// Inline asm operand type must be `Sized`.
     InlineAsmSized,
     /// `[T, ..n]` implies that `T` must be `Copy`.
@@ -252,19 +253,26 @@ pub enum ObligationCauseCode<'tcx> {
 
     DerivedObligation(DerivedObligationCause<'tcx>),
 
+    FunctionArgumentObligation {
+        /// The node of the relevant argument in the function call.
+        arg_hir_id: hir::HirId,
+        /// The node of the function call.
+        call_hir_id: hir::HirId,
+        /// The obligation introduced by this argument.
+        parent_code: Lrc<ObligationCauseCode<'tcx>>,
+    },
+
     /// Error derived when matching traits/impls; see ObligationCause for more details
     CompareImplConstObligation,
 
     /// Error derived when matching traits/impls; see ObligationCause for more details
     CompareImplMethodObligation {
-        item_name: Symbol,
         impl_item_def_id: DefId,
         trait_item_def_id: DefId,
     },
 
     /// Error derived when matching traits/impls; see ObligationCause for more details
     CompareImplTypeObligation {
-        item_name: Symbol,
         impl_item_def_id: DefId,
         trait_item_def_id: DefId,
     },
@@ -304,6 +312,9 @@ pub enum ObligationCauseCode<'tcx> {
     /// Intrinsic has wrong type
     IntrinsicType,
 
+    /// A let else block does not diverge
+    LetElse,
+
     /// Method receiver
     MethodReceiver,
 
@@ -326,17 +337,50 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// If `X` is the concrete type of an opaque type `impl Y`, then `X` must implement `Y`
     OpaqueType,
+
+    /// Well-formed checking. If a `WellFormedLoc` is provided,
+    /// then it will be used to eprform HIR-based wf checking
+    /// after an error occurs, in order to generate a more precise error span.
+    /// This is purely for diagnostic purposes - it is always
+    /// correct to use `MiscObligation` instead, or to specify
+    /// `WellFormed(None)`
+    WellFormed(Option<WellFormedLoc>),
+
+    /// From `match_impl`. The cause for us having to match an impl, and the DefId we are matching against.
+    MatchImpl(ObligationCause<'tcx>, DefId),
+}
+
+/// The 'location' at which we try to perform HIR-based wf checking.
+/// This information is used to obtain an `hir::Ty`, which
+/// we can walk in order to obtain precise spans for any
+/// 'nested' types (e.g. `Foo` in `Option<Foo>`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable)]
+pub enum WellFormedLoc {
+    /// Use the type of the provided definition.
+    Ty(LocalDefId),
+    /// Use the type of the parameter of the provided function.
+    /// We cannot use `hir::Param`, since the function may
+    /// not have a body (e.g. a trait method definition)
+    Param {
+        /// The function to lookup the parameter in
+        function: LocalDefId,
+        /// The index of the parameter to use.
+        /// Parameters are indexed from 0, with the return type
+        /// being the last 'parameter'
+        param_idx: u16,
+    },
 }
 
 impl ObligationCauseCode<'_> {
     // Return the base obligation, ignoring derived obligations.
     pub fn peel_derives(&self) -> &Self {
         let mut base_cause = self;
-        while let BuiltinDerivedObligation(cause)
-        | ImplDerivedObligation(cause)
-        | DerivedObligation(cause) = base_cause
+        while let BuiltinDerivedObligation(DerivedObligationCause { parent_code, .. })
+        | ImplDerivedObligation(DerivedObligationCause { parent_code, .. })
+        | DerivedObligation(DerivedObligationCause { parent_code, .. })
+        | FunctionArgumentObligation { parent_code, .. } = base_cause
         {
-            base_cause = &cause.parent_code;
+            base_cause = &parent_code;
         }
         base_cause
     }
@@ -389,20 +433,33 @@ pub struct DerivedObligationCause<'tcx> {
     pub parent_trait_ref: ty::PolyTraitRef<'tcx>,
 
     /// The parent trait had this cause.
-    pub parent_code: Rc<ObligationCauseCode<'tcx>>,
+    pub parent_code: Lrc<ObligationCauseCode<'tcx>>,
 }
 
 #[derive(Clone, Debug, TypeFoldable, Lift)]
 pub enum SelectionError<'tcx> {
+    /// The trait is not implemented.
     Unimplemented,
+    /// After a closure impl has selected, its "outputs" were evaluated
+    /// (which for closures includes the "input" type params) and they
+    /// didn't resolve. See `confirm_poly_trait_refs` for more.
     OutputTypeParameterMismatch(
         ty::PolyTraitRef<'tcx>,
         ty::PolyTraitRef<'tcx>,
         ty::error::TypeError<'tcx>,
     ),
+    /// The trait pointed by `DefId` is not object safe.
     TraitNotObjectSafe(DefId),
+    /// A given constant couldn't be evaluated.
     NotConstEvaluatable(NotConstEvaluatable),
+    /// Exceeded the recursion depth during type projection.
     Overflow,
+    /// Signaling that an error has already been emitted, to avoid
+    /// multiple errors being shown.
+    ErrorReporting,
+    /// Multiple applicable `impl`s where found. The `DefId`s correspond to
+    /// all the `impl`s' Items.
+    Ambiguous(Vec<DefId>),
 }
 
 /// When performing resolution, it is typically the case that there
@@ -426,10 +483,10 @@ pub type SelectionResult<'tcx, T> = Result<Option<T>, SelectionError<'tcx>>;
 /// impl Clone for i32 { ... }                   // Impl_3
 ///
 /// fn foo<T: Clone>(concrete: Option<Box<i32>>, param: T, mixed: Option<T>) {
-///     // Case A: Vtable points at a specific impl. Only possible when
+///     // Case A: ImplSource points at a specific impl. Only possible when
 ///     // type is concretely known. If the impl itself has bounded
-///     // type parameters, Vtable will carry resolutions for those as well:
-///     concrete.clone(); // Vtable(Impl_1, [Vtable(Impl_2, [Vtable(Impl_3)])])
+///     // type parameters, ImplSource will carry resolutions for those as well:
+///     concrete.clone(); // ImpleSource(Impl_1, [ImplSource(Impl_2, [ImplSource(Impl_3)])])
 ///
 ///     // Case A: ImplSource points at a specific impl. Only possible when
 ///     // type is concretely known. If the impl itself has bounded
@@ -463,7 +520,7 @@ pub enum ImplSource<'tcx, N> {
     /// for some type parameter. The `Vec<N>` represents the
     /// obligations incurred from normalizing the where-clause (if
     /// any).
-    Param(Vec<N>, Constness),
+    Param(Vec<N>, ty::BoundConstness),
 
     /// Virtual calls through an object.
     Object(ImplSourceObjectData<'tcx, N>),
@@ -471,8 +528,11 @@ pub enum ImplSource<'tcx, N> {
     /// Successful resolution for a builtin trait.
     Builtin(ImplSourceBuiltinData<N>),
 
+    /// ImplSource for trait upcasting coercion
+    TraitUpcasting(ImplSourceTraitUpcastingData<'tcx, N>),
+
     /// ImplSource automatically generated for a closure. The `DefId` is the ID
-    /// of the closure expression. This is a `ImplSource::UserDefined` in spirit, but the
+    /// of the closure expression. This is an `ImplSource::UserDefined` in spirit, but the
     /// impl is generated by the compiler and does not appear in the source.
     Closure(ImplSourceClosureData<'tcx, N>),
 
@@ -490,6 +550,9 @@ pub enum ImplSource<'tcx, N> {
 
     /// ImplSource for a trait alias.
     TraitAlias(ImplSourceTraitAliasData<'tcx, N>),
+
+    /// ImplSource for a `const Drop` implementation.
+    ConstDrop(ImplSourceConstDropData),
 }
 
 impl<'tcx, N> ImplSource<'tcx, N> {
@@ -504,8 +567,10 @@ impl<'tcx, N> ImplSource<'tcx, N> {
             ImplSource::Object(d) => d.nested,
             ImplSource::FnPointer(d) => d.nested,
             ImplSource::DiscriminantKind(ImplSourceDiscriminantKindData)
-            | ImplSource::Pointee(ImplSourcePointeeData) => Vec::new(),
+            | ImplSource::Pointee(ImplSourcePointeeData)
+            | ImplSource::ConstDrop(ImplSourceConstDropData) => Vec::new(),
             ImplSource::TraitAlias(d) => d.nested,
+            ImplSource::TraitUpcasting(d) => d.nested,
         }
     }
 
@@ -520,8 +585,10 @@ impl<'tcx, N> ImplSource<'tcx, N> {
             ImplSource::Object(d) => &d.nested[..],
             ImplSource::FnPointer(d) => &d.nested[..],
             ImplSource::DiscriminantKind(ImplSourceDiscriminantKindData)
-            | ImplSource::Pointee(ImplSourcePointeeData) => &[],
+            | ImplSource::Pointee(ImplSourcePointeeData)
+            | ImplSource::ConstDrop(ImplSourceConstDropData) => &[],
             ImplSource::TraitAlias(d) => &d.nested[..],
+            ImplSource::TraitUpcasting(d) => &d.nested[..],
         }
     }
 
@@ -573,6 +640,16 @@ impl<'tcx, N> ImplSource<'tcx, N> {
                 substs: d.substs,
                 nested: d.nested.into_iter().map(f).collect(),
             }),
+            ImplSource::TraitUpcasting(d) => {
+                ImplSource::TraitUpcasting(ImplSourceTraitUpcastingData {
+                    upcast_trait_ref: d.upcast_trait_ref,
+                    vtable_vptr_slot: d.vtable_vptr_slot,
+                    nested: d.nested.into_iter().map(f).collect(),
+                })
+            }
+            ImplSource::ConstDrop(ImplSourceConstDropData) => {
+                ImplSource::ConstDrop(ImplSourceConstDropData)
+            }
         }
     }
 }
@@ -619,6 +696,20 @@ pub struct ImplSourceAutoImplData<N> {
 }
 
 #[derive(Clone, PartialEq, Eq, TyEncodable, TyDecodable, HashStable, TypeFoldable, Lift)]
+pub struct ImplSourceTraitUpcastingData<'tcx, N> {
+    /// `Foo` upcast to the obligation trait. This will be some supertrait of `Foo`.
+    pub upcast_trait_ref: ty::PolyTraitRef<'tcx>,
+
+    /// The vtable is formed by concatenating together the method lists of
+    /// the base object trait and all supertraits, pointers to supertrait vtable will
+    /// be provided when necessary; this is the position of `upcast_trait_ref`'s vtable
+    /// within that vtable.
+    pub vtable_vptr_slot: Option<usize>,
+
+    pub nested: Vec<N>,
+}
+
+#[derive(Clone, PartialEq, Eq, TyEncodable, TyDecodable, HashStable, TypeFoldable, Lift)]
 pub struct ImplSourceBuiltinData<N> {
     pub nested: Vec<N>,
 }
@@ -629,8 +720,9 @@ pub struct ImplSourceObjectData<'tcx, N> {
     pub upcast_trait_ref: ty::PolyTraitRef<'tcx>,
 
     /// The vtable is formed by concatenating together the method lists of
-    /// the base object trait and all supertraits; this is the start of
-    /// `upcast_trait_ref`'s methods in that vtable.
+    /// the base object trait and all supertraits, pointers to supertrait vtable will
+    /// be provided when necessary; this is the start of `upcast_trait_ref`'s methods
+    /// in that vtable.
     pub vtable_base: usize,
 
     pub nested: Vec<N>,
@@ -649,6 +741,9 @@ pub struct ImplSourceDiscriminantKindData;
 #[derive(Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, HashStable)]
 pub struct ImplSourcePointeeData;
 
+#[derive(Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, HashStable)]
+pub struct ImplSourceConstDropData;
+
 #[derive(Clone, PartialEq, Eq, TyEncodable, TyDecodable, HashStable, TypeFoldable, Lift)]
 pub struct ImplSourceTraitAliasData<'tcx, N> {
     pub alias_def_id: DefId,
@@ -656,7 +751,7 @@ pub struct ImplSourceTraitAliasData<'tcx, N> {
     pub nested: Vec<N>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, HashStable)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, HashStable, PartialOrd, Ord)]
 pub enum ObjectSafetyViolation {
     /// `Self: Sized` declared on the trait.
     SizedSelf(SmallVec<[Span; 1]>),
@@ -805,7 +900,7 @@ impl ObjectSafetyViolation {
 }
 
 /// Reasons a method might not be object-safe.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable, PartialOrd, Ord)]
 pub enum MethodViolationCode {
     /// e.g., `fn foo()`
     StaticMethod(Option<(&'static str, Span)>, Span, bool /* has args */),

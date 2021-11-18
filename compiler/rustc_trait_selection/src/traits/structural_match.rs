@@ -17,9 +17,9 @@ pub enum NonStructuralMatchTy<'tcx> {
     Dynamic,
     Foreign,
     Opaque,
+    Closure,
     Generator,
     Projection,
-    Closure,
 }
 
 /// This method traverses the structure of `ty`, trying to find an
@@ -103,7 +103,7 @@ fn type_marked_structural(
     //
     // 2. We are sometimes doing future-incompatibility lints for
     //    now, so we do not want unconditional errors here.
-    fulfillment_cx.select_all_or_error(infcx).is_ok()
+    fulfillment_cx.select_all_or_error(infcx).is_empty()
 }
 
 /// This implements the traversal over the structure of a given type to try to
@@ -131,6 +131,9 @@ impl Search<'a, 'tcx> {
 
 impl<'a, 'tcx> TypeVisitor<'tcx> for Search<'a, 'tcx> {
     type BreakTy = NonStructuralMatchTy<'tcx>;
+    fn tcx_for_anon_const_substs(&self) -> Option<TyCtxt<'tcx>> {
+        Some(self.tcx())
+    }
 
     fn visit_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
         debug!("Search visiting ty: {:?}", ty);
@@ -152,11 +155,11 @@ impl<'a, 'tcx> TypeVisitor<'tcx> for Search<'a, 'tcx> {
             ty::Projection(..) => {
                 return ControlFlow::Break(NonStructuralMatchTy::Projection);
             }
-            ty::Generator(..) | ty::GeneratorWitness(..) => {
-                return ControlFlow::Break(NonStructuralMatchTy::Generator);
-            }
             ty::Closure(..) => {
                 return ControlFlow::Break(NonStructuralMatchTy::Closure);
+            }
+            ty::Generator(..) | ty::GeneratorWitness(..) => {
+                return ControlFlow::Break(NonStructuralMatchTy::Generator);
             }
             ty::RawPtr(..) => {
                 // structural-match ignores substructure of

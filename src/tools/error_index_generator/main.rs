@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use rustc_span::edition::DEFAULT_EDITION;
 
-use rustdoc::html::markdown::{ErrorCodes, IdMap, Markdown, Playground};
+use rustdoc::html::markdown::{ErrorCodes, HeadingOffset, IdMap, Markdown, Playground};
 
 pub struct ErrorMetadata {
     pub description: Option<String>,
@@ -67,6 +67,7 @@ impl Formatter for HTMLFormatter {
 <title>Rust Compiler Error Index</title>
 <meta charset="utf-8">
 <!-- Include rust.css after light.css so its rules take priority. -->
+<link rel="stylesheet" type="text/css" href="rustdoc{suffix}.css"/>
 <link rel="stylesheet" type="text/css" href="light{suffix}.css"/>
 <link rel="stylesheet" type="text/css" href="rust.css"/>
 <style>
@@ -118,14 +119,15 @@ impl Formatter for HTMLFormatter {
                 write!(
                     output,
                     "{}",
-                    Markdown(
-                        desc,
-                        &[],
-                        &mut id_map,
-                        ErrorCodes::Yes,
-                        DEFAULT_EDITION,
-                        &Some(playground)
-                    )
+                    Markdown {
+                        content: desc,
+                        links: &[],
+                        ids: &mut id_map,
+                        error_codes: ErrorCodes::Yes,
+                        edition: DEFAULT_EDITION,
+                        playground: &Some(playground),
+                        heading_offset: HeadingOffset::H1,
+                    }
                     .into_string()
                 )?
             }
@@ -142,56 +144,41 @@ impl Formatter for HTMLFormatter {
             r##"<script>
 function onEach(arr, func) {{
     if (arr && arr.length > 0 && func) {{
-        for (var i = 0; i < arr.length; i++) {{
-            func(arr[i]);
-        }}
-    }}
-}}
-
-function hasClass(elem, className) {{
-    if (elem && className && elem.className) {{
-        var elemClass = elem.className;
-        var start = elemClass.indexOf(className);
-        if (start === -1) {{
-            return false;
-        }} else if (elemClass.length === className.length) {{
-            return true;
-        }} else {{
-            if (start > 0 && elemClass[start - 1] !== ' ') {{
-                return false;
+        var length = arr.length;
+        var i;
+        for (i = 0; i < length; ++i) {{
+            if (func(arr[i])) {{
+                return true;
             }}
-            var end = start + className.length;
-            if (end < elemClass.length && elemClass[end] !== ' ') {{
-                return false;
-            }}
-            return true;
         }}
-        if (start > 0 && elemClass[start - 1] !== ' ') {{
-            return false;
-        }}
-        var end = start + className.length;
-        if (end < elemClass.length && elemClass[end] !== ' ') {{
-            return false;
-        }}
-        return true;
     }}
     return false;
 }}
 
-onEach(document.getElementsByClassName('rust-example-rendered'), function(e) {{
+function onEachLazy(lazyArray, func) {{
+    return onEach(
+        Array.prototype.slice.call(lazyArray),
+        func);
+}}
+
+function hasClass(elem, className) {{
+    return elem && elem.classList && elem.classList.contains(className);
+}}
+
+onEachLazy(document.getElementsByClassName('rust-example-rendered'), function(e) {{
     if (hasClass(e, 'compile_fail')) {{
         e.addEventListener("mouseover", function(event) {{
-            e.previousElementSibling.childNodes[0].style.color = '#f00';
+            e.parentElement.previousElementSibling.childNodes[0].style.color = '#f00';
         }});
         e.addEventListener("mouseout", function(event) {{
-            e.previousElementSibling.childNodes[0].style.color = '';
+            e.parentElement.previousElementSibling.childNodes[0].style.color = '';
         }});
     }} else if (hasClass(e, 'ignore')) {{
         e.addEventListener("mouseover", function(event) {{
-            e.previousElementSibling.childNodes[0].style.color = '#ff9200';
+            e.parentElement.previousElementSibling.childNodes[0].style.color = '#ff9200';
         }});
         e.addEventListener("mouseout", function(event) {{
-            e.previousElementSibling.childNodes[0].style.color = '';
+            e.parentElement.previousElementSibling.childNodes[0].style.color = '';
         }});
     }}
 }});
@@ -283,7 +270,8 @@ fn parse_args() -> (OutputFormat, PathBuf) {
 fn main() {
     rustc_driver::init_env_logger("RUST_LOG");
     let (format, dst) = parse_args();
-    let result = rustc_span::with_default_session_globals(move || main_with_result(format, &dst));
+    let result =
+        rustc_span::create_default_session_globals_then(move || main_with_result(format, &dst));
     if let Err(e) = result {
         panic!("{}", e.to_string());
     }

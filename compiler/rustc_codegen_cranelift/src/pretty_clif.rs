@@ -61,9 +61,8 @@ use cranelift_codegen::{
     write::{FuncWriter, PlainWriter},
 };
 
-use rustc_middle::ty::layout::FnAbiExt;
+use rustc_middle::ty::layout::FnAbiOf;
 use rustc_session::config::OutputType;
-use rustc_target::abi::call::FnAbi;
 
 use crate::prelude::*;
 
@@ -81,7 +80,10 @@ impl CommentWriter {
             vec![
                 format!("symbol {}", tcx.symbol_name(instance).name),
                 format!("instance {:?}", instance),
-                format!("abi {:?}", FnAbi::of_instance(&RevealAllLayoutCx(tcx), instance, &[])),
+                format!(
+                    "abi {:?}",
+                    RevealAllLayoutCx(tcx).fn_abi_of_instance(instance, ty::List::empty())
+                ),
                 String::new(),
             ]
         } else {
@@ -233,7 +235,7 @@ pub(crate) fn write_ir_file(
 pub(crate) fn write_clif_file<'tcx>(
     tcx: TyCtxt<'tcx>,
     postfix: &str,
-    isa: Option<&dyn cranelift_codegen::isa::TargetIsa>,
+    isa: &dyn cranelift_codegen::isa::TargetIsa,
     instance: Instance<'tcx>,
     context: &cranelift_codegen::Context,
     mut clif_comments: &CommentWriter,
@@ -242,22 +244,23 @@ pub(crate) fn write_clif_file<'tcx>(
         tcx,
         || format!("{}.{}.clif", tcx.symbol_name(instance).name, postfix),
         |file| {
-            let value_ranges = isa
-                .map(|isa| context.build_value_labels_ranges(isa).expect("value location ranges"));
-
             let mut clif = String::new();
             cranelift_codegen::write::decorate_function(
                 &mut clif_comments,
                 &mut clif,
                 &context.func,
-                &DisplayFunctionAnnotations { isa, value_ranges: value_ranges.as_ref() },
+                &DisplayFunctionAnnotations { isa: Some(isa), value_ranges: None },
             )
             .unwrap();
 
-            writeln!(file, "test compile")?;
-            writeln!(file, "set is_pic")?;
-            writeln!(file, "set enable_simd")?;
-            writeln!(file, "target {} haswell", crate::target_triple(tcx.sess))?;
+            for flag in isa.flags().iter() {
+                writeln!(file, "set {}", flag)?;
+            }
+            write!(file, "target {}", isa.triple().architecture.to_string())?;
+            for isa_flag in isa.isa_flags().iter() {
+                write!(file, " {}", isa_flag)?;
+            }
+            writeln!(file, "\n")?;
             writeln!(file)?;
             file.write_all(clif.as_bytes())?;
             Ok(())

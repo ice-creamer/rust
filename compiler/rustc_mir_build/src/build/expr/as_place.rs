@@ -217,16 +217,18 @@ fn to_upvars_resolved_place_builder<'a, 'tcx>(
                 ty::ClosureKind::FnOnce => {}
             }
 
-            let (capture_index, capture) = if let Some(capture_details) =
+            // We won't be building MIR if the closure wasn't local
+            let closure_hir_id = tcx.hir().local_def_id_to_hir_id(closure_def_id.expect_local());
+            let closure_span = tcx.hir().span(closure_hir_id);
+
+            let Some((capture_index, capture)) =
                 find_capture_matching_projections(
                     typeck_results,
                     var_hir_id,
                     closure_def_id,
                     &from_builder.projection,
-                ) {
-                capture_details
-            } else {
-                if !tcx.features().capture_disjoint_fields {
+                ) else {
+                if !enable_precise_capture(tcx, closure_span) {
                     bug!(
                         "No associated capture found for {:?}[{:#?}] even though \
                             capture_disjoint_fields isn't enabled",
@@ -242,8 +244,7 @@ fn to_upvars_resolved_place_builder<'a, 'tcx>(
                 return Err(from_builder);
             };
 
-            let closure_ty = typeck_results
-                .node_type(tcx.hir().local_def_id_to_hir_id(closure_def_id.expect_local()));
+            let closure_ty = typeck_results.node_type(closure_hir_id);
 
             let substs = match closure_ty.kind() {
                 ty::Closure(_, substs) => ty::UpvarSubsts::Closure(substs),
@@ -504,10 +505,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         Statement {
                             source_info,
                             kind: StatementKind::AscribeUserType(
-                                box (
+                                Box::new((
                                     place,
                                     UserTypeProjection { base: annotation_index, projs: vec![] },
-                                ),
+                                )),
                                 Variance::Invariant,
                             ),
                         },
@@ -531,10 +532,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         Statement {
                             source_info,
                             kind: StatementKind::AscribeUserType(
-                                box (
+                                Box::new((
                                     Place::from(temp),
                                     UserTypeProjection { base: annotation_index, projs: vec![] },
-                                ),
+                                )),
                                 Variance::Invariant,
                             ),
                         },
@@ -562,6 +563,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::If { .. }
             | ExprKind::Loop { .. }
             | ExprKind::Block { .. }
+            | ExprKind::Let { .. }
             | ExprKind::Assign { .. }
             | ExprKind::AssignOp { .. }
             | ExprKind::Break { .. }
@@ -687,7 +689,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             lt,
             Rvalue::BinaryOp(
                 BinOp::Lt,
-                box (Operand::Copy(Place::from(index)), Operand::Copy(len)),
+                Box::new((Operand::Copy(Place::from(index)), Operand::Copy(len))),
             ),
         );
         let msg = BoundsCheck { len: Operand::Move(len), index: Operand::Copy(Place::from(index)) };
@@ -779,4 +781,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.cfg.push_fake_read(bb, source_info, FakeReadCause::ForIndex, Place::from(*temp));
         }
     }
+}
+
+/// Precise capture is enabled if the feature gate `capture_disjoint_fields` is enabled or if
+/// user is using Rust Edition 2021 or higher.
+fn enable_precise_capture(tcx: TyCtxt<'_>, closure_span: Span) -> bool {
+    tcx.features().capture_disjoint_fields || closure_span.rust_2021()
 }

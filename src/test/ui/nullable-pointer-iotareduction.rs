@@ -1,10 +1,8 @@
 // run-pass
 
-#![feature(box_syntax)]
-
 // Iota-reduction is a rule in the Calculus of (Co-)Inductive Constructions,
 // which "says that a destructor applied to an object built from a constructor
-// behaves as expected".  -- http://coq.inria.fr/doc/Reference-Manual006.html
+// behaves as expected".  -- https://coq.inria.fr/doc/language/core/conversion.html#iota-reduction
 //
 // It's a little more complicated here, because of pointers and regions and
 // trying to get assert failure messages that at least identify which case
@@ -64,7 +62,7 @@ macro_rules! check_type {
 
 pub fn main() {
     check_type!(&17, &isize);
-    check_type!(box 18, Box<isize>);
+    check_type!(Box::new(18), Box<isize>);
     check_type!("foo".to_string(), String);
     check_type!(vec![20, 22], Vec<isize>);
     check_type!(main, fn(), |pthing| {

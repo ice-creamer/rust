@@ -1,14 +1,5 @@
-warning: the feature `capture_disjoint_fields` is incomplete and may not be safe to use and/or cause compiler crashes
-  --> $DIR/liveness_unintentional_copy.rs:2:12
-   |
-LL | #![feature(capture_disjoint_fields)]
-   |            ^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: `#[warn(incomplete_features)]` on by default
-   = note: see issue #53488 <https://github.com/rust-lang/rust/issues/53488> for more information
-
 warning: value assigned to `a` is never read
-  --> $DIR/liveness_unintentional_copy.rs:19:9
+  --> $DIR/liveness_unintentional_copy.rs:20:9
    |
 LL |         a = s;
    |         ^
@@ -22,7 +13,7 @@ LL | #![warn(unused)]
    = help: maybe it is overwritten before being read?
 
 warning: unused variable: `a`
-  --> $DIR/liveness_unintentional_copy.rs:19:9
+  --> $DIR/liveness_unintentional_copy.rs:20:9
    |
 LL |         a = s;
    |         ^
@@ -36,12 +27,12 @@ LL | #![warn(unused)]
    = help: did you mean to capture by reference instead?
 
 warning: unused variable: `a`
-  --> $DIR/liveness_unintentional_copy.rs:35:9
+  --> $DIR/liveness_unintentional_copy.rs:36:9
    |
 LL |         a += x;
    |         ^
    |
    = help: did you mean to capture by reference instead?
 
-warning: 4 warnings emitted
+warning: 3 warnings emitted
 

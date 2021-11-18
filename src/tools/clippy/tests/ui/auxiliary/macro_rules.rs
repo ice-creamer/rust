@@ -106,3 +106,17 @@ macro_rules! field_reassign_with_default {
         }
     };
 }
+
+#[macro_export]
+macro_rules! default_numeric_fallback {
+    () => {
+        let x = 22;
+    };
+}
+
+#[macro_export]
+macro_rules! mut_mut {
+    () => {
+        let mut_mut_ty: &mut &mut u32 = &mut &mut 1u32;
+    };
+}

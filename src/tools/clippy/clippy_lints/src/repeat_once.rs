@@ -11,17 +11,20 @@ use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::sym;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for usage of `.repeat(1)` and suggest the following method for each types.
+    /// ### What it does
+    /// Checks for usage of `.repeat(1)` and suggest the following method for each types.
     /// - `.to_string()` for `str`
     /// - `.clone()` for `String`
     /// - `.to_vec()` for `slice`
     ///
-    /// **Why is this bad?** For example, `String.repeat(1)` is equivalent to `.clone()`. If cloning the string is the intention behind this, `clone()` should be used.
+    /// The lint will evaluate constant expressions and values as arguments of `.repeat(..)` and emit a message if
+    /// they are equivalent to `1`. (Related discussion in [rust-clippy#7306](https://github.com/rust-lang/rust-clippy/issues/7306))
     ///
-    /// **Known problems:** None.
+    /// ### Why is this bad?
+    /// For example, `String.repeat(1)` is equivalent to `.clone()`. If cloning
+    /// the string is the intention behind this, `clone()` should be used.
     ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// ```rust
     /// fn main() {
     ///     let x = String::from("hello world").repeat(1);
@@ -45,7 +48,7 @@ impl<'tcx> LateLintPass<'tcx> for RepeatOnce {
         if_chain! {
             if let ExprKind::MethodCall(path, _, [receiver, count], _) = &expr.kind;
             if path.ident.name == sym!(repeat);
-            if let Some(Constant::Int(1)) = constant_context(cx, cx.typeck_results()).expr(count);
+            if constant_context(cx, cx.typeck_results()).expr(count) == Some(Constant::Int(1));
             if !in_macro(receiver.span);
             then {
                 let ty = cx.typeck_results().expr_ty(receiver).peel_refs();
@@ -69,7 +72,7 @@ impl<'tcx> LateLintPass<'tcx> for RepeatOnce {
                         format!("{}.to_vec()", snippet(cx, receiver.span, r#""...""#)),
                         Applicability::MachineApplicable,
                     );
-                } else if is_type_diagnostic_item(cx, ty, sym::string_type) {
+                } else if is_type_diagnostic_item(cx, ty, sym::String) {
                     span_lint_and_sugg(
                         cx,
                         REPEAT_ONCE,

@@ -50,7 +50,8 @@ if [ -f "$docker_dir/$image/Dockerfile" ]; then
       # Look for all source files involves in the COPY command
       copied_files=/tmp/.docker-copied-files.txt
       rm -f "$copied_files"
-      for i in $(sed -n -e 's/^COPY \(.*\) .*$/\1/p' "$docker_dir/$image/Dockerfile"); do
+      for i in $(sed -n -e '/^COPY --from=/! s/^COPY \(.*\) .*$/\1/p' \
+          "$docker_dir/$image/Dockerfile"); do
         # List the file names
         find "$script_dir/$i" -type f >> $copied_files
       done
@@ -70,8 +71,13 @@ if [ -f "$docker_dir/$image/Dockerfile" ]; then
       echo "Attempting to download $url"
       rm -f /tmp/rustci_docker_cache
       set +e
-      retry curl -y 30 -Y 10 --connect-timeout 30 -f -L -C - -o /tmp/rustci_docker_cache "$url"
-      loaded_images=$(docker load -i /tmp/rustci_docker_cache | sed 's/.* sha/sha/')
+      retry curl --max-time 600 -y 30 -Y 10 --connect-timeout 30 -f -L -C - \
+        -o /tmp/rustci_docker_cache "$url"
+      echo "Loading images into docker"
+      # docker load sometimes hangs in the CI, so time out after 10 minutes with TERM,
+      # KILL after 12 minutes
+      loaded_images=$(/usr/bin/timeout -k 720 600 docker load -i /tmp/rustci_docker_cache \
+        | sed 's/.* sha/sha/')
       set -e
       echo "Downloaded containers:\n$loaded_images"
     fi
@@ -219,6 +225,16 @@ else
   command="/checkout/src/ci/run.sh"
 fi
 
+if [ "$CI" != "" ]; then
+  # Get some needed information for $BASE_COMMIT
+  #
+  # This command gets the last merge commit which we'll use as base to list
+  # deleted files since then.
+  BASE_COMMIT="$(git log --author=bors@rust-lang.org -n 2 --pretty=format:%H | tail -n 1)"
+else
+  BASE_COMMIT=""
+fi
+
 docker \
   run \
   --workdir /checkout/obj \
@@ -237,6 +253,7 @@ docker \
   --env TOOLSTATE_PUBLISH \
   --env RUST_CI_OVERRIDE_RELEASE_CHANNEL \
   --env CI_JOB_NAME="${CI_JOB_NAME-$IMAGE}" \
+  --env BASE_COMMIT="$BASE_COMMIT" \
   --init \
   --rm \
   rust-ci \

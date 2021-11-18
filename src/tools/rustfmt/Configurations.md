@@ -17,7 +17,7 @@ To enable unstable options, set `unstable_features = true` in `rustfmt.toml` or 
 
 Below you find a detailed visual guide on all the supported configuration options of rustfmt:
 
-## `array_width` 
+## `array_width`
 
 Maximum width of an array literal before falling back to vertical formatting.
 
@@ -25,11 +25,11 @@ Maximum width of an array literal before falling back to vertical formatting.
 - **Possible values**: any positive integer that is less than or equal to the value specified for [`max_width`](#max_width)
 - **Stable**: Yes
 
-By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `array_width` will take precedence. 
+By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `array_width` will take precedence.
 
 See also [`max_width`](#max_width) and [`use_small_heuristics`](#use_small_heuristics)
 
-## `attr_fn_like_width` 
+## `attr_fn_like_width`
 
 Maximum width of the args of a function-like attributes before falling back to vertical formatting.
 
@@ -37,7 +37,7 @@ Maximum width of the args of a function-like attributes before falling back to v
 - **Possible values**: any positive integer that is less than or equal to the value specified for [`max_width`](#max_width)
 - **Stable**: Yes
 
-By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `attr_fn_like_width` will take precedence. 
+By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `attr_fn_like_width` will take precedence.
 
 See also [`max_width`](#max_width) and [`use_small_heuristics`](#use_small_heuristics)
 
@@ -295,7 +295,7 @@ where
 }
 ```
 
-## `chain_width` 
+## `chain_width`
 
 Maximum width of a chain to fit on one line.
 
@@ -303,7 +303,7 @@ Maximum width of a chain to fit on one line.
 - **Possible values**: any positive integer that is less than or equal to the value specified for [`max_width`](#max_width)
 - **Stable**: Yes
 
-By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `chain_width` will take precedence. 
+By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `chain_width` will take precedence.
 
 See also [`max_width`](#max_width) and [`use_small_heuristics`](#use_small_heuristics)
 
@@ -521,11 +521,13 @@ fn main() {
 
 ## `disable_all_formatting`
 
-Don't reformat anything
+Don't reformat anything.
+
+Note that this option may be soft-deprecated in the future once the [ignore](#ignore) option is stabilized. Nightly toolchain users are encouraged to use [ignore](#ignore) instead when possible.
 
 - **Default value**: `false`
 - **Possible values**: `true`, `false`
-- **Stable**: No (tracking issue: #3388)
+- **Stable**: Yes
 
 ## `edition`
 
@@ -751,7 +753,7 @@ trait Lorem {
 }
 ```
 
-## `fn_call_width` 
+## `fn_call_width`
 
 Maximum width of the args of a function call before falling back to vertical formatting.
 
@@ -759,7 +761,7 @@ Maximum width of the args of a function call before falling back to vertical for
 - **Possible values**: any positive integer that is less than or equal to the value specified for [`max_width`](#max_width)
 - **Stable**: Yes
 
-By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `fn_call_width` will take precedence. 
+By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `fn_call_width` will take precedence.
 
 See also [`max_width`](#max_width) and [`use_small_heuristics`](#use_small_heuristics)
 
@@ -924,6 +926,15 @@ fn add_one(x: i32) -> i32 {
 }
 ```
 
+## `format_generated_files`
+
+Format generated files. A file is considered generated
+if any of the first five lines contains `@generated` marker.
+
+- **Default value**: `false`
+- **Possible values**: `true`, `false`
+- **Stable**: No
+
 ## `format_macro_matchers`
 
 Format the metavariable matching patterns in macros.
@@ -1047,6 +1058,13 @@ fn lorem() -> usize {
 
 See also: [`tab_spaces`](#tab_spaces).
 
+## `hex_literal_case`
+
+Control the case of the letters in hexadecimal literal values
+
+- **Default value**: `Preserve`
+- **Possible values**: `Upper`, `Lower`
+- **Stable**: No
 
 ## `hide_parse_errors`
 
@@ -1475,7 +1493,9 @@ Copyright 2018 The Rust Project Developers.`, etc.:
 
 ## `match_arm_blocks`
 
-Wrap the body of arms in blocks when it does not fit on the same line with the pattern of arms
+Controls whether arm bodies are wrapped in cases where the first line of the body cannot fit on the same line as the `=>` operator.
+
+The Style Guide requires that bodies are block wrapped by default if a line break is required after the `=>`, but this option can be used to disable that behavior to prevent wrapping arm bodies in that event, so long as the body does not contain multiple statements nor line comments.
 
 - **Default value**: `true`
 - **Possible values**: `true`, `false`
@@ -1486,10 +1506,16 @@ Wrap the body of arms in blocks when it does not fit on the same line with the p
 ```rust
 fn main() {
     match lorem {
-        true => {
+        ipsum => {
             foooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo(x)
         }
-        false => println!("{}", sit),
+        dolor => println!("{}", sit),
+        sit => foo(
+            "foooooooooooooooooooooooo",
+            "baaaaaaaaaaaaaaaaaaaaaaaarr",
+            "baaaaaaaaaaaaaaaaaaaazzzzzzzzzzzzz",
+            "qqqqqqqqquuuuuuuuuuuuuuuuuuuuuuuuuuxxx",
+        ),
     }
 }
 ```
@@ -1499,9 +1525,15 @@ fn main() {
 ```rust
 fn main() {
     match lorem {
-        true =>
+        lorem =>
             foooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo(x),
-        false => println!("{}", sit),
+        ipsum => println!("{}", sit),
+        sit => foo(
+            "foooooooooooooooooooooooo",
+            "baaaaaaaaaaaaaaaaaaaaaaaarr",
+            "baaaaaaaaaaaaaaaaaaaazzzzzzzzzzzzz",
+            "qqqqqqqqquuuuuuuuuuuuuuuuuuuuuuuuuuxxx",
+        ),
     }
 }
 ```
@@ -1596,7 +1628,7 @@ Put a trailing comma after a block based match arm (non-block arms are not affec
 
 - **Default value**: `false`
 - **Possible values**: `true`, `false`
-- **Stable**: No (tracking issue: #3380)
+- **Stable**: Yes
 
 #### `false` (default):
 
@@ -1654,6 +1686,9 @@ pub enum Foo {}
 #### `false`:
 
 ```rust
+#[derive(Eq, PartialEq, Debug, Copy, Clone)]
+pub enum Bar {}
+
 #[derive(Eq, PartialEq)]
 #[derive(Debug)]
 #[derive(Copy, Clone)]
@@ -1665,7 +1700,7 @@ pub enum Foo {}
 How imports should be grouped into `use` statements. Imports will be merged or split to the configured level of granularity.
 
 - **Default value**: `Preserve`
-- **Possible values**: `Preserve`, `Crate`, `Module`, `Item`
+- **Possible values**: `Preserve`, `Crate`, `Module`, `Item`, `One`
 - **Stable**: No
 
 #### `Preserve` (default):
@@ -1717,6 +1752,23 @@ use foo::c;
 use foo::d::e;
 use qux::h;
 use qux::i;
+```
+
+#### `One`:
+
+Merge all imports into a single `use` statement as long as they have the same visibility.
+
+```rust
+pub use foo::{x, y};
+use {
+    bar::{
+        a,
+        b::{self, f, g},
+        c,
+        d::e,
+    },
+    qux::{h, i},
+};
 ```
 
 ## `merge_imports`
@@ -1810,6 +1862,9 @@ Convert `#![doc]` and `#[doc]` attributes to `//!` and `///` doc comments.
 #![doc = "Example documentation"]
 
 #[doc = "Example item documentation"]
+pub enum Bar {}
+
+/// Example item documentation
 pub enum Foo {}
 ```
 
@@ -1924,6 +1979,8 @@ fn main() {
 #### `false`:
 ```rust
 fn main() {
+    (foo());
+
     ((((foo()))));
 }
 ```
@@ -1948,6 +2005,14 @@ impl Iterator for Dummy {
     }
 
     type Item = i32;
+}
+
+impl Iterator for Dummy {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
 }
 ```
 
@@ -1997,7 +2062,7 @@ use sit;
 Controls the strategy for how imports are grouped together.
 
 - **Default value**: `Preserve`
-- **Possible values**: `Preserve`, `StdExternalCrate`
+- **Possible values**: `Preserve`, `StdExternalCrate`, `One`
 - **Stable**: No
 
 #### `Preserve` (default):
@@ -2041,6 +2106,23 @@ use uuid::Uuid;
 use super::schema::{Context, Payload};
 use super::update::convert_publish_payload;
 use crate::models::Event;
+```
+
+#### `One`:
+
+Discard existing import groups, and create a single group for everything
+
+```rust
+use super::schema::{Context, Payload};
+use super::update::convert_publish_payload;
+use crate::models::Event;
+use alloc::alloc::Layout;
+use broker::database::PooledConnection;
+use chrono::Utc;
+use core::f32;
+use juniper::{FieldError, FieldResult};
+use std::sync::Arc;
+use uuid::Uuid;
 ```
 
 ## `reorder_modules`
@@ -2124,7 +2206,7 @@ Don't reformat out of line modules
 - **Possible values**: `true`, `false`
 - **Stable**: No (tracking issue: #3389)
 
-## `single_line_if_else_max_width` 
+## `single_line_if_else_max_width`
 
 Maximum line length for single line if-else expressions. A value of `0` (zero) results in if-else expressions always being broken into multiple lines. Note this occurs when `use_small_heuristics` is set to `Off`.
 
@@ -2132,7 +2214,7 @@ Maximum line length for single line if-else expressions. A value of `0` (zero) r
 - **Possible values**: any positive integer that is less than or equal to the value specified for [`max_width`](#max_width)
 - **Stable**: Yes
 
-By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `single_line_if_else_max_width` will take precedence. 
+By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `single_line_if_else_max_width` will take precedence.
 
 See also [`max_width`](#max_width) and [`use_small_heuristics`](#use_small_heuristics)
 
@@ -2313,7 +2395,7 @@ fn main() {
 
 See also: [`indent_style`](#indent_style).
 
-## `struct_lit_width` 
+## `struct_lit_width`
 
 Maximum width in the body of a struct literal before falling back to vertical formatting. A value of `0` (zero) results in struct literals always being broken into multiple lines. Note this occurs when `use_small_heuristics` is set to `Off`.
 
@@ -2321,11 +2403,11 @@ Maximum width in the body of a struct literal before falling back to vertical fo
 - **Possible values**: any positive integer that is less than or equal to the value specified for [`max_width`](#max_width)
 - **Stable**: Yes
 
-By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `struct_lit_width` will take precedence. 
+By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `struct_lit_width` will take precedence.
 
 See also [`max_width`](#max_width), [`use_small_heuristics`](#use_small_heuristics), and [`struct_lit_single_line`](#struct_lit_single_line)
 
-## `struct_variant_width` 
+## `struct_variant_width`
 
 Maximum width in the body of a struct variant before falling back to vertical formatting. A value of `0` (zero) results in struct literals always being broken into multiple lines. Note this occurs when `use_small_heuristics` is set to `Off`.
 
@@ -2333,7 +2415,7 @@ Maximum width in the body of a struct variant before falling back to vertical fo
 - **Possible values**: any positive integer that is less than or equal to the value specified for [`max_width`](#max_width)
 - **Stable**: Yes
 
-By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `struct_variant_width` will take precedence. 
+By default this option is set as a percentage of [`max_width`](#max_width) provided by [`use_small_heuristics`](#use_small_heuristics), but a value set directly for `struct_variant_width` will take precedence.
 
 See also [`max_width`](#max_width) and [`use_small_heuristics`](#use_small_heuristics)
 
@@ -2505,7 +2587,8 @@ fn main() {
     let x = 1;
     let y = 2;
     let z = 3;
-    let a = Foo { x: x, y: y, z: z };
+    let a = Foo { x, y, z };
+    let b = Foo { x: x, y: y, z: z };
 }
 ```
 
@@ -2530,7 +2613,7 @@ fn main() {
 
 This option can be used to simplify the management and bulk updates of the granular width configuration settings ([`fn_call_width`](#fn_call_width), [`attr_fn_like_width`](#attr_fn_like_width), [`struct_lit_width`](#struct_lit_width), [`struct_variant_width`](#struct_variant_width), [`array_width`](#array_width), [`chain_width`](#chain_width), [`single_line_if_else_max_width`](#single_line_if_else_max_width)), that respectively control when formatted constructs are multi-lined/vertical based on width.
 
-Note that explicitly provided values for the width configuration settings take precedence and override the calculated values determined by `use_small_heuristics`. 
+Note that explicitly provided values for the width configuration settings take precedence and override the calculated values determined by `use_small_heuristics`.
 
 - **Default value**: `"Default"`
 - **Possible values**: `"Default"`, `"Off"`, `"Max"`
@@ -2595,7 +2678,7 @@ fn main() {
 ```
 
 #### `Off`:
-When `use_small_heuristics` is set to `Off`, the granular width settings are functionally disabled and ignored. See the documentation for the respective width config options for specifics. 
+When `use_small_heuristics` is set to `Off`, the granular width settings are functionally disabled and ignored. See the documentation for the respective width config options for specifics.
 
 ```rust
 enum Lorem {
@@ -2674,6 +2757,8 @@ Replace uses of the try! macro by the ? shorthand
 
 ```rust
 fn main() {
+    let lorem = ipsum.map(|dolor| dolor.sit())?;
+
     let lorem = try!(ipsum.map(|dolor| dolor.sit()));
 }
 ```
@@ -2745,6 +2830,12 @@ Break comments to fit on the line
 #### `false` (default):
 
 ```rust
+// Lorem ipsum dolor sit amet, consectetur adipiscing elit,
+// sed do eiusmod tempor incididunt ut labore et dolore
+// magna aliqua. Ut enim ad minim veniam, quis nostrud
+// exercitation ullamco laboris nisi ut aliquip ex ea
+// commodo consequat.
+
 // Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
 ```
 

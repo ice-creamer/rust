@@ -13,7 +13,7 @@ use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::{bug, span_bug};
+use rustc_middle::{bug, span_bug, ty::Instance};
 use rustc_span::{Pos, Span, Symbol};
 use rustc_target::abi::*;
 use rustc_target::asm::*;
@@ -105,7 +105,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
         let r = r.unwrap();
 
         // Again, based on how many outputs we have
-        let outputs = ia.outputs.iter().zip(&outputs).filter(|&(ref o, _)| !o.is_indirect);
+        let outputs = ia.outputs.iter().zip(&outputs).filter(|&(o, _)| !o.is_indirect);
         for (i, (_, &place)) in outputs.enumerate() {
             let v = if num_outputs == 1 { r } else { self.extract_value(r, i as u64) };
             OperandValue::Immediate(v).store(self, place);
@@ -120,6 +120,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
         operands: &[InlineAsmOperandRef<'tcx, Self>],
         options: InlineAsmOptions,
         line_spans: &[Span],
+        instance: Instance<'_>,
     ) {
         let asm_arch = self.tcx.sess.asm_arch.unwrap();
 
@@ -128,13 +129,17 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
         let mut clobbers = vec![];
         let mut output_types = vec![];
         let mut op_idx = FxHashMap::default();
+        let mut clobbered_x87 = false;
         for (idx, op) in operands.iter().enumerate() {
             match *op {
                 InlineAsmOperandRef::Out { reg, late, place } => {
                     let is_target_supported = |reg_class: InlineAsmRegClass| {
                         for &(_, feature) in reg_class.supported_types(asm_arch) {
                             if let Some(feature) = feature {
-                                if self.tcx.sess.target_features.contains(&Symbol::intern(feature))
+                                let codegen_fn_attrs = self.tcx.codegen_fn_attrs(instance.def_id());
+                                let feature_name = Symbol::intern(feature);
+                                if self.tcx.sess.target_features.contains(&feature_name)
+                                    || codegen_fn_attrs.target_features.contains(&feature_name)
                                 {
                                     return true;
                                 }
@@ -150,7 +155,27 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                     let ty = if let Some(ref place) = place {
                         layout = Some(&place.layout);
                         llvm_fixup_output_type(self.cx, reg.reg_class(), &place.layout)
-                    } else if !is_target_supported(reg.reg_class()) {
+                    } else if matches!(
+                        reg.reg_class(),
+                        InlineAsmRegClass::X86(
+                            X86InlineAsmRegClass::mmx_reg | X86InlineAsmRegClass::x87_reg
+                        )
+                    ) {
+                        // Special handling for x87/mmx registers: we always
+                        // clobber the whole set if one register is marked as
+                        // clobbered. This is due to the way LLVM handles the
+                        // FP stack in inline assembly.
+                        if !clobbered_x87 {
+                            clobbered_x87 = true;
+                            clobbers.push("~{st}".to_string());
+                            for i in 1..=7 {
+                                clobbers.push(format!("~{{st({})}}", i));
+                            }
+                        }
+                        continue;
+                    } else if !is_target_supported(reg.reg_class())
+                        || reg.reg_class().is_clobber_only(asm_arch)
+                    {
                         // We turn discarded outputs into clobber constraints
                         // if the target feature needed by the register class is
                         // disabled. This is necessary otherwise LLVM will try
@@ -281,11 +306,19 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                         "~{flags}".to_string(),
                     ]);
                 }
-                InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {}
+                InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {
+                    constraints.extend_from_slice(&[
+                        "~{vtype}".to_string(),
+                        "~{vl}".to_string(),
+                        "~{vxsat}".to_string(),
+                        "~{vxrm}".to_string(),
+                    ]);
+                }
                 InlineAsmArch::Nvptx64 => {}
                 InlineAsmArch::PowerPC | InlineAsmArch::PowerPC64 => {}
                 InlineAsmArch::Hexagon => {}
                 InlineAsmArch::Mips | InlineAsmArch::Mips64 => {}
+                InlineAsmArch::S390x => {}
                 InlineAsmArch::SpirV => {}
                 InlineAsmArch::Wasm32 => {}
                 InlineAsmArch::Bpf => {}
@@ -302,7 +335,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
         let output_type = match &output_types[..] {
             [] => self.type_void(),
             [ty] => ty,
-            tys => self.type_struct(&tys, false),
+            tys => self.type_struct(tys, false),
         };
         let dialect = match asm_arch {
             InlineAsmArch::X86 | InlineAsmArch::X86_64
@@ -404,7 +437,7 @@ impl AsmMethods for CodegenCx<'ll, 'tcx> {
     }
 }
 
-fn inline_asm_call(
+pub(crate) fn inline_asm_call(
     bx: &mut Builder<'a, 'll, 'tcx>,
     asm: &str,
     cons: &str,
@@ -443,7 +476,7 @@ fn inline_asm_call(
                 alignstack,
                 llvm::AsmDialect::from_generic(dia),
             );
-            let call = bx.call(v, inputs, None);
+            let call = bx.call(fty, v, inputs, None);
 
             // Store mark in a metadata node so we can map LLVM errors
             // back to source locations.  See #17552.
@@ -565,6 +598,9 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg) => "w",
             InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg_low16) => "x",
+            InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::preg) => {
+                unreachable!("clobber-only")
+            }
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg_thumb) => "l",
             InlineAsmRegClass::Arm(ArmInlineAsmRegClass::sreg)
@@ -584,8 +620,15 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg_nonzero) => "b",
             InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::freg) => "f",
+            InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::cr)
+            | InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::xer) => {
+                unreachable!("clobber-only")
+            }
             InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::freg) => "f",
+            InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::vreg) => {
+                unreachable!("clobber-only")
+            }
             InlineAsmRegClass::X86(X86InlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd) => "Q",
             InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_byte) => "q",
@@ -593,9 +636,14 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             | InlineAsmRegClass::X86(X86InlineAsmRegClass::ymm_reg) => "x",
             InlineAsmRegClass::X86(X86InlineAsmRegClass::zmm_reg) => "v",
             InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => "^Yk",
+            InlineAsmRegClass::X86(
+                X86InlineAsmRegClass::x87_reg | X86InlineAsmRegClass::mmx_reg,
+            ) => unreachable!("clobber-only"),
             InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => "r",
             InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::wreg) => "w",
+            InlineAsmRegClass::S390x(S390xInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::S390x(S390xInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
                 bug!("LLVM backend does not support SPIR-V")
             }
@@ -616,6 +664,9 @@ fn modifier_to_llvm(
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg)
         | InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg_low16) => {
             if modifier == Some('v') { None } else { modifier }
+        }
+        InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::preg) => {
+            unreachable!("clobber-only")
         }
         InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg)
         | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg_thumb) => None,
@@ -639,6 +690,9 @@ fn modifier_to_llvm(
         InlineAsmRegClass::PowerPC(_) => None,
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg)
         | InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::freg) => None,
+        InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::vreg) => {
+            unreachable!("clobber-only")
+        }
         InlineAsmRegClass::X86(X86InlineAsmRegClass::reg)
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd) => match modifier {
             None if arch == InlineAsmArch::X86_64 => Some('q'),
@@ -663,8 +717,12 @@ fn modifier_to_llvm(
             _ => unreachable!(),
         },
         InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => None,
+        InlineAsmRegClass::X86(X86InlineAsmRegClass::x87_reg | X86InlineAsmRegClass::mmx_reg) => {
+            unreachable!("clobber-only")
+        }
         InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => None,
         InlineAsmRegClass::Bpf(_) => None,
+        InlineAsmRegClass::S390x(_) => None,
         InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
             bug!("LLVM backend does not support SPIR-V")
         }
@@ -680,6 +738,9 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg)
         | InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg_low16) => {
             cx.type_vector(cx.type_i64(), 2)
+        }
+        InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::preg) => {
+            unreachable!("clobber-only")
         }
         InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg)
         | InlineAsmRegClass::Arm(ArmInlineAsmRegClass::reg_thumb) => cx.type_i32(),
@@ -702,8 +763,15 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg_nonzero) => cx.type_i32(),
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::freg) => cx.type_f64(),
+        InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::cr)
+        | InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::xer) => {
+            unreachable!("clobber-only")
+        }
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::freg) => cx.type_f32(),
+        InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::vreg) => {
+            unreachable!("clobber-only")
+        }
         InlineAsmRegClass::X86(X86InlineAsmRegClass::reg)
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd) => cx.type_i32(),
         InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_byte) => cx.type_i8(),
@@ -711,9 +779,14 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::ymm_reg)
         | InlineAsmRegClass::X86(X86InlineAsmRegClass::zmm_reg) => cx.type_f32(),
         InlineAsmRegClass::X86(X86InlineAsmRegClass::kreg) => cx.type_i16(),
+        InlineAsmRegClass::X86(X86InlineAsmRegClass::x87_reg | X86InlineAsmRegClass::mmx_reg) => {
+            unreachable!("clobber-only")
+        }
         InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => cx.type_i32(),
         InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::reg) => cx.type_i64(),
         InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::wreg) => cx.type_i32(),
+        InlineAsmRegClass::S390x(S390xInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::S390x(S390xInlineAsmRegClass::freg) => cx.type_f64(),
         InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
             bug!("LLVM backend does not support SPIR-V")
         }
@@ -723,7 +796,7 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
 
 /// Helper function to get the LLVM type for a Scalar. Pointers are returned as
 /// the equivalent integer type.
-fn llvm_asm_scalar_type(cx: &CodegenCx<'ll, 'tcx>, scalar: &Scalar) -> &'ll Type {
+fn llvm_asm_scalar_type(cx: &CodegenCx<'ll, 'tcx>, scalar: Scalar) -> &'ll Type {
     match scalar.value {
         Primitive::Int(Integer::I8, _) => cx.type_i8(),
         Primitive::Int(Integer::I16, _) => cx.type_i16(),
@@ -743,7 +816,7 @@ fn llvm_fixup_input(
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Value {
-    match (reg, &layout.abi) {
+    match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
             if let Primitive::Int(Integer::I8, _) = s.value {
                 let vec_ty = bx.cx.type_vector(bx.cx.type_i8(), 8);
@@ -766,7 +839,7 @@ fn llvm_fixup_input(
             Abi::Vector { element, count },
         ) if layout.size.bytes() == 8 => {
             let elem_ty = llvm_asm_scalar_type(bx.cx, element);
-            let vec_ty = bx.cx.type_vector(elem_ty, *count);
+            let vec_ty = bx.cx.type_vector(elem_ty, count);
             let indices: Vec<_> = (0..count * 2).map(|x| bx.const_i32(x as i32)).collect();
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
         }
@@ -821,7 +894,7 @@ fn llvm_fixup_output(
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Value {
-    match (reg, &layout.abi) {
+    match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
             if let Primitive::Int(Integer::I8, _) = s.value {
                 bx.extract_element(value, bx.const_i32(0))
@@ -841,8 +914,8 @@ fn llvm_fixup_output(
             Abi::Vector { element, count },
         ) if layout.size.bytes() == 8 => {
             let elem_ty = llvm_asm_scalar_type(bx.cx, element);
-            let vec_ty = bx.cx.type_vector(elem_ty, *count * 2);
-            let indices: Vec<_> = (0..*count).map(|x| bx.const_i32(x as i32)).collect();
+            let vec_ty = bx.cx.type_vector(elem_ty, count * 2);
+            let indices: Vec<_> = (0..count).map(|x| bx.const_i32(x as i32)).collect();
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
         }
         (InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd), Abi::Scalar(s))
@@ -896,7 +969,7 @@ fn llvm_fixup_output_type(
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Type {
-    match (reg, &layout.abi) {
+    match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
             if let Primitive::Int(Integer::I8, _) = s.value {
                 cx.type_vector(cx.type_i8(), 8)

@@ -149,6 +149,10 @@ impl<'a> LintExtractor<'a> {
                         } else if line.starts_with("// ") {
                             // Ignore comments.
                             continue;
+                        } else if line.starts_with("#[allow") {
+                            // Ignore allow of lints (useful for
+                            // invalid_rust_codeblocks).
+                            continue;
                         } else {
                             let name = lint_name(line).map_err(|e| {
                                 format!(
@@ -467,7 +471,9 @@ fn lint_name(line: &str) -> Result<String, &'static str> {
                 return Err("lint name should end with comma");
             }
             let name = &name[..name.len() - 1];
-            if !name.chars().all(|ch| ch.is_uppercase() || ch == '_') || name.is_empty() {
+            if !name.chars().all(|ch| ch.is_uppercase() || ch.is_ascii_digit() || ch == '_')
+                || name.is_empty()
+            {
                 return Err("lint name did not have expected format");
             }
             Ok(name.to_lowercase().to_string())

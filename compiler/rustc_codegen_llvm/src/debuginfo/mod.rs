@@ -5,7 +5,6 @@ use rustc_codegen_ssa::mir::debuginfo::VariableKind::*;
 use self::metadata::{file_metadata, type_metadata, TypeMap};
 use self::metadata::{UNKNOWN_COLUMN_NUMBER, UNKNOWN_LINE_NUMBER};
 use self::namespace::mangled_name_of_instance;
-use self::type_names::compute_debuginfo_type_name;
 use self::utils::{create_DIArray, is_node_local_to_unit, DIB};
 
 use crate::abi::FnAbi;
@@ -26,13 +25,14 @@ use rustc_data_structures::sync::Lrc;
 use rustc_hir::def_id::{DefId, DefIdMap};
 use rustc_index::vec::IndexVec;
 use rustc_middle::mir;
-use rustc_middle::ty::layout::HasTyCtxt;
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf};
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::{self, Instance, ParamEnv, Ty, TypeFoldable};
 use rustc_session::config::{self, DebugInfo};
+use rustc_session::Session;
 use rustc_span::symbol::Symbol;
 use rustc_span::{self, BytePos, Pos, SourceFile, SourceFileAndLine, Span};
-use rustc_target::abi::{LayoutOf, Primitive, Size};
+use rustc_target::abi::{Primitive, Size};
 
 use libc::c_uint;
 use smallvec::SmallVec;
@@ -96,45 +96,52 @@ impl<'a, 'tcx> CrateDebugContext<'a, 'tcx> {
             composite_types_completed: Default::default(),
         }
     }
+
+    pub fn finalize(&self, sess: &Session) {
+        unsafe {
+            llvm::LLVMRustDIBuilderFinalize(self.builder);
+
+            // Debuginfo generation in LLVM by default uses a higher
+            // version of dwarf than macOS currently understands. We can
+            // instruct LLVM to emit an older version of dwarf, however,
+            // for macOS to understand. For more info see #11352
+            // This can be overridden using --llvm-opts -dwarf-version,N.
+            // Android has the same issue (#22398)
+            if let Some(version) = sess.target.dwarf_version {
+                llvm::LLVMRustAddModuleFlag(self.llmod, "Dwarf Version\0".as_ptr().cast(), version)
+            }
+
+            // Indicate that we want CodeView debug information on MSVC
+            if sess.target.is_like_msvc {
+                llvm::LLVMRustAddModuleFlag(self.llmod, "CodeView\0".as_ptr().cast(), 1)
+            }
+
+            // Prevent bitcode readers from deleting the debug info.
+            let ptr = "Debug Info Version\0".as_ptr();
+            llvm::LLVMRustAddModuleFlag(
+                self.llmod,
+                ptr.cast(),
+                llvm::LLVMRustDebugMetadataVersion(),
+            );
+        }
+    }
 }
 
 /// Creates any deferred debug metadata nodes
 pub fn finalize(cx: &CodegenCx<'_, '_>) {
-    if cx.dbg_cx.is_none() {
-        return;
-    }
+    if let Some(dbg_cx) = &cx.dbg_cx {
+        debug!("finalize");
 
-    debug!("finalize");
-
-    if gdb::needs_gdb_debug_scripts_section(cx) {
-        // Add a .debug_gdb_scripts section to this compile-unit. This will
-        // cause GDB to try and load the gdb_load_rust_pretty_printers.py file,
-        // which activates the Rust pretty printers for binary this section is
-        // contained in.
-        gdb::get_or_insert_gdb_debug_scripts_section_global(cx);
-    }
-
-    unsafe {
-        llvm::LLVMRustDIBuilderFinalize(DIB(cx));
-        // Debuginfo generation in LLVM by default uses a higher
-        // version of dwarf than macOS currently understands. We can
-        // instruct LLVM to emit an older version of dwarf, however,
-        // for macOS to understand. For more info see #11352
-        // This can be overridden using --llvm-opts -dwarf-version,N.
-        // Android has the same issue (#22398)
-        if let Some(version) = cx.sess().target.dwarf_version {
-            llvm::LLVMRustAddModuleFlag(cx.llmod, "Dwarf Version\0".as_ptr().cast(), version)
+        if gdb::needs_gdb_debug_scripts_section(cx) {
+            // Add a .debug_gdb_scripts section to this compile-unit. This will
+            // cause GDB to try and load the gdb_load_rust_pretty_printers.py file,
+            // which activates the Rust pretty printers for binary this section is
+            // contained in.
+            gdb::get_or_insert_gdb_debug_scripts_section_global(cx);
         }
 
-        // Indicate that we want CodeView debug information on MSVC
-        if cx.sess().target.is_like_msvc {
-            llvm::LLVMRustAddModuleFlag(cx.llmod, "CodeView\0".as_ptr().cast(), 1)
-        }
-
-        // Prevent bitcode readers from deleting the debug info.
-        let ptr = "Debug Info Version\0".as_ptr();
-        llvm::LLVMRustAddModuleFlag(cx.llmod, ptr.cast(), llvm::LLVMRustDebugMetadataVersion());
-    };
+        dbg_cx.finalize(cx.sess());
+    }
 }
 
 impl DebugInfoBuilderMethods for Builder<'a, 'll, 'tcx> {
@@ -311,17 +318,17 @@ impl DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
             llvm::LLVMRustDIBuilderCreateSubroutineType(DIB(self), fn_signature)
         };
 
-        // Find the enclosing function, in case this is a closure.
-        let def_key = self.tcx().def_key(def_id);
-        let mut name = def_key.disambiguated_data.data.to_string();
+        let mut name = String::new();
+        type_names::push_item_name(self.tcx(), def_id, false, &mut name);
 
-        let enclosing_fn_def_id = self.tcx().closure_base_def_id(def_id);
+        // Find the enclosing function, in case this is a closure.
+        let enclosing_fn_def_id = self.tcx().typeck_root_def_id(def_id);
 
         // Get_template_parameters() will append a `<...>` clause to the function
         // name if necessary.
         let generics = self.tcx().generics_of(enclosing_fn_def_id);
         let substs = instance.substs.truncate_to(self.tcx(), generics);
-        let template_parameters = get_template_parameters(self, &generics, substs, &mut name);
+        let template_parameters = get_template_parameters(self, generics, substs, &mut name);
 
         let linkage_name = &mangled_name_of_instance(self, instance).name;
         // Omit the linkage_name if it is the same as subprogram name.
@@ -428,23 +435,15 @@ impl DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
             substs: SubstsRef<'tcx>,
             name_to_append_suffix_to: &mut String,
         ) -> &'ll DIArray {
+            type_names::push_generic_params(
+                cx.tcx,
+                cx.tcx.normalize_erasing_regions(ty::ParamEnv::reveal_all(), substs),
+                name_to_append_suffix_to,
+            );
+
             if substs.types().next().is_none() {
                 return create_DIArray(DIB(cx), &[]);
             }
-
-            name_to_append_suffix_to.push('<');
-            for (i, actual_type) in substs.types().enumerate() {
-                if i != 0 {
-                    name_to_append_suffix_to.push(',');
-                }
-
-                let actual_type =
-                    cx.tcx.normalize_erasing_regions(ParamEnv::reveal_all(), actual_type);
-                // Add actual type name to <...> clause of function name
-                let actual_type_name = compute_debuginfo_type_name(cx.tcx(), actual_type, true);
-                name_to_append_suffix_to.push_str(&actual_type_name[..]);
-            }
-            name_to_append_suffix_to.push('>');
 
             // Again, only create type information if full debuginfo is enabled
             let template_params: Vec<_> = if cx.sess().opts.debuginfo == DebugInfo::Full {
@@ -508,7 +507,7 @@ impl DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
                         ty::Adt(def, ..) if !def.is_box() => {
                             // Again, only create type information if full debuginfo is enabled
                             if cx.sess().opts.debuginfo == DebugInfo::Full
-                                && !impl_self_ty.needs_subst()
+                                && !impl_self_ty.definitely_needs_subst(cx.tcx)
                             {
                                 Some(type_metadata(cx, impl_self_ty, rustc_span::DUMMY_SP))
                             } else {
@@ -551,8 +550,13 @@ impl DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         unsafe { llvm::LLVMRustDIBuilderCreateDebugLocation(line, col, scope, inlined_at) }
     }
 
-    fn create_vtable_metadata(&self, ty: Ty<'tcx>, vtable: Self::Value) {
-        metadata::create_vtable_metadata(self, ty, vtable)
+    fn create_vtable_metadata(
+        &self,
+        ty: Ty<'tcx>,
+        trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
+        vtable: Self::Value,
+    ) {
+        metadata::create_vtable_metadata(self, ty, trait_ref, vtable)
     }
 
     fn extend_scope_to_file(
@@ -560,7 +564,7 @@ impl DebugInfoMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         scope_metadata: &'ll DIScope,
         file: &rustc_span::SourceFile,
     ) -> &'ll DILexicalBlock {
-        metadata::extend_scope_to_file(&self, scope_metadata, file)
+        metadata::extend_scope_to_file(self, scope_metadata, file)
     }
 
     fn debuginfo_finalize(&self) {

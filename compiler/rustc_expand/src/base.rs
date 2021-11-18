@@ -1,6 +1,7 @@
 use crate::expand::{self, AstFragment, Invocation};
 use crate::module::DirOwnership;
 
+use rustc_ast::attr::MarkedAttrs;
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Nonterminal};
 use rustc_ast::tokenstream::{CanSynthesizeMissingTokens, TokenStream};
@@ -9,14 +10,14 @@ use rustc_ast::{self as ast, AstLike, Attribute, Item, NodeId, PatKind};
 use rustc_attr::{self as attr, Deprecation, Stability};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::{self, Lrc};
-use rustc_errors::{DiagnosticBuilder, ErrorReported};
+use rustc_errors::{Applicability, DiagnosticBuilder, ErrorReported};
 use rustc_lint_defs::builtin::PROC_MACRO_BACK_COMPAT;
 use rustc_lint_defs::BuiltinLintDiagnostics;
 use rustc_parse::{self, nt_to_tokenstream, parser, MACRO_ARGUMENTS};
 use rustc_session::{parse::ParseSess, Limit, Session};
-use rustc_span::def_id::{CrateNum, DefId};
+use rustc_span::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_span::edition::Edition;
-use rustc_span::hygiene::{AstPass, ExpnData, ExpnId, ExpnKind};
+use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{FileName, MultiSpan, Span, DUMMY_SP};
@@ -29,6 +30,9 @@ use std::rc::Rc;
 
 crate use rustc_span::hygiene::MacroKind;
 
+// When adding new variants, make sure to
+// adjust the `visit_*` / `flat_map_*` calls in `InvocationCollector`
+// to use `assign_id!`
 #[derive(Debug, Clone)]
 pub enum Annotatable {
     Item(P<ast::Item>),
@@ -350,6 +354,7 @@ pub trait MacResult {
     fn make_expr(self: Box<Self>) -> Option<P<ast::Expr>> {
         None
     }
+
     /// Creates zero or more items.
     fn make_items(self: Box<Self>) -> Option<SmallVec<[P<ast::Item>; 1]>> {
         None
@@ -649,10 +654,7 @@ pub enum SyntaxExtensionKind {
     /// A trivial attribute "macro" that does nothing,
     /// only keeps the attribute and marks it as inert,
     /// thus making it ineligible for further expansion.
-    NonMacroAttr {
-        /// Suppresses the `unused_attributes` lint for this attribute.
-        mark_used: bool,
-    },
+    NonMacroAttr,
 
     /// A token-based derive macro.
     Derive(
@@ -701,7 +703,7 @@ impl SyntaxExtension {
             SyntaxExtensionKind::Bang(..) | SyntaxExtensionKind::LegacyBang(..) => MacroKind::Bang,
             SyntaxExtensionKind::Attr(..)
             | SyntaxExtensionKind::LegacyAttr(..)
-            | SyntaxExtensionKind::NonMacroAttr { .. } => MacroKind::Attr,
+            | SyntaxExtensionKind::NonMacroAttr => MacroKind::Attr,
             SyntaxExtensionKind::Derive(..) | SyntaxExtensionKind::LegacyDerive(..) => {
                 MacroKind::Derive
             }
@@ -745,9 +747,17 @@ impl SyntaxExtension {
             }
         }
 
-        let builtin_name = sess
+        let (builtin_name, helper_attrs) = sess
             .find_by_name(attrs, sym::rustc_builtin_macro)
-            .map(|a| a.value_str().unwrap_or(name));
+            .map(|attr| {
+                // Override `helper_attrs` passed above if it's a built-in macro,
+                // marking `proc_macro_derive` macros as built-in is not a realistic use case.
+                parse_macro_name_and_helper_attrs(sess.diagnostic(), attr, "built-in").map_or_else(
+                    || (Some(name), Vec::new()),
+                    |(name, helper_attrs)| (Some(name), helper_attrs),
+                )
+            })
+            .unwrap_or_else(|| (None, helper_attrs));
         let (stability, const_stability) = attr::find_stability(&sess, attrs, span);
         if let Some((_, sp)) = const_stability {
             sess.parse_sess
@@ -799,28 +809,21 @@ impl SyntaxExtension {
         SyntaxExtension::default(SyntaxExtensionKind::Derive(Box::new(expander)), edition)
     }
 
-    pub fn non_macro_attr(mark_used: bool, edition: Edition) -> SyntaxExtension {
-        SyntaxExtension::default(SyntaxExtensionKind::NonMacroAttr { mark_used }, edition)
+    pub fn non_macro_attr(edition: Edition) -> SyntaxExtension {
+        SyntaxExtension::default(SyntaxExtensionKind::NonMacroAttr, edition)
     }
 
     pub fn expn_data(
         &self,
-        parent: ExpnId,
+        parent: LocalExpnId,
         call_site: Span,
         descr: Symbol,
         macro_def_id: Option<DefId>,
+        parent_module: Option<DefId>,
     ) -> ExpnData {
-        use SyntaxExtensionKind::*;
-        let proc_macro = match self.kind {
-            // User-defined proc macro
-            Bang(..) | Attr(..) | Derive(..) => true,
-            // Consider everthing else to be not a proc
-            // macro for diagnostic purposes
-            LegacyBang(..) | LegacyAttr(..) | NonMacroAttr { .. } | LegacyDerive(..) => false,
-        };
         ExpnData::new(
-            ExpnKind::Macro { kind: self.macro_kind(), name: descr, proc_macro },
-            parent,
+            ExpnKind::Macro(self.macro_kind(), descr),
+            parent.to_expn_id(),
             call_site,
             self.span,
             self.allow_internal_unstable.clone(),
@@ -828,6 +831,7 @@ impl SyntaxExtension {
             self.local_inner_macros,
             self.edition,
             macro_def_id,
+            parent_module,
         )
     }
 }
@@ -835,13 +839,18 @@ impl SyntaxExtension {
 /// Error type that denotes indeterminacy.
 pub struct Indeterminate;
 
-pub type DeriveResolutions = Vec<(ast::Path, Option<Lrc<SyntaxExtension>>)>;
+pub type DeriveResolutions = Vec<(ast::Path, Annotatable, Option<Lrc<SyntaxExtension>>)>;
 
 pub trait ResolverExpand {
     fn next_node_id(&mut self) -> NodeId;
+    fn invocation_parent(&self, id: LocalExpnId) -> LocalDefId;
 
     fn resolve_dollar_crates(&mut self);
-    fn visit_ast_fragment_with_placeholders(&mut self, expn_id: ExpnId, fragment: &AstFragment);
+    fn visit_ast_fragment_with_placeholders(
+        &mut self,
+        expn_id: LocalExpnId,
+        fragment: &AstFragment,
+    );
     fn register_builtin_macro(&mut self, name: Symbol, ext: SyntaxExtensionKind);
 
     fn expansion_for_ast_pass(
@@ -850,41 +859,50 @@ pub trait ResolverExpand {
         pass: AstPass,
         features: &[Symbol],
         parent_module_id: Option<NodeId>,
-    ) -> ExpnId;
+    ) -> LocalExpnId;
 
     fn resolve_imports(&mut self);
 
     fn resolve_macro_invocation(
         &mut self,
         invoc: &Invocation,
-        eager_expansion_root: ExpnId,
+        eager_expansion_root: LocalExpnId,
         force: bool,
     ) -> Result<Lrc<SyntaxExtension>, Indeterminate>;
 
     fn check_unused_macros(&mut self);
 
-    /// Some parent node that is close enough to the given macro call.
-    fn lint_node_id(&self, expn_id: ExpnId) -> NodeId;
-
     // Resolver interfaces for specific built-in macros.
     /// Does `#[derive(...)]` attribute with the given `ExpnId` have built-in `Copy` inside it?
-    fn has_derive_copy(&self, expn_id: ExpnId) -> bool;
+    fn has_derive_copy(&self, expn_id: LocalExpnId) -> bool;
     /// Resolve paths inside the `#[derive(...)]` attribute with the given `ExpnId`.
     fn resolve_derives(
         &mut self,
-        expn_id: ExpnId,
+        expn_id: LocalExpnId,
         force: bool,
         derive_paths: &dyn Fn() -> DeriveResolutions,
     ) -> Result<(), Indeterminate>;
     /// Take resolutions for paths inside the `#[derive(...)]` attribute with the given `ExpnId`
     /// back from resolver.
-    fn take_derive_resolutions(&mut self, expn_id: ExpnId) -> Option<DeriveResolutions>;
+    fn take_derive_resolutions(&mut self, expn_id: LocalExpnId) -> Option<DeriveResolutions>;
     /// Path resolution logic for `#[cfg_accessible(path)]`.
-    fn cfg_accessible(&mut self, expn_id: ExpnId, path: &ast::Path) -> Result<bool, Indeterminate>;
+    fn cfg_accessible(
+        &mut self,
+        expn_id: LocalExpnId,
+        path: &ast::Path,
+    ) -> Result<bool, Indeterminate>;
 
     /// Decodes the proc-macro quoted span in the specified crate, with the specified id.
     /// No caching is performed.
     fn get_proc_macro_quoted_span(&self, krate: CrateNum, id: usize) -> Span;
+
+    /// The order of items in the HIR is unrelated to the order of
+    /// items in the AST. However, we generate proc macro harnesses
+    /// based on the AST order, and later refer to these harnesses
+    /// from the HIR. This field keeps track of the order in which
+    /// we generated proc macros harnesses, so that we can map
+    /// HIR proc macros items back to their harness items.
+    fn declare_proc_macro(&mut self, id: NodeId);
 }
 
 #[derive(Clone, Default)]
@@ -911,11 +929,14 @@ impl ModuleData {
 
 #[derive(Clone)]
 pub struct ExpansionData {
-    pub id: ExpnId,
+    pub id: LocalExpnId,
     pub depth: usize,
     pub module: Rc<ModuleData>,
     pub dir_ownership: DirOwnership,
     pub prior_type_ascription: Option<(Span, bool)>,
+    /// Some parent node that is close to this macro call
+    pub lint_node_id: NodeId,
+    pub is_trailing_mac: bool,
 }
 
 type OnExternModLoaded<'a> =
@@ -939,6 +960,10 @@ pub struct ExtCtxt<'a> {
     ///
     /// `Ident` is the module name.
     pub(super) extern_mod_loaded: OnExternModLoaded<'a>,
+    /// When we 'expand' an inert attribute, we leave it
+    /// in the AST, but insert it here so that we know
+    /// not to expand it again.
+    pub(super) expanded_inert_attrs: MarkedAttrs,
 }
 
 impl<'a> ExtCtxt<'a> {
@@ -956,14 +981,17 @@ impl<'a> ExtCtxt<'a> {
             extern_mod_loaded,
             root_path: PathBuf::new(),
             current_expansion: ExpansionData {
-                id: ExpnId::root(),
+                id: LocalExpnId::ROOT,
                 depth: 0,
                 module: Default::default(),
                 dir_ownership: DirOwnership::Owned { relative: None },
                 prior_type_ascription: None,
+                lint_node_id: ast::CRATE_NODE_ID,
+                is_trailing_mac: false,
             },
             force_mode: false,
             expansions: FxHashMap::default(),
+            expanded_inert_attrs: MarkedAttrs::new(),
         }
     }
 
@@ -993,19 +1021,19 @@ impl<'a> ExtCtxt<'a> {
     /// Equivalent of `Span::def_site` from the proc macro API,
     /// except that the location is taken from the span passed as an argument.
     pub fn with_def_site_ctxt(&self, span: Span) -> Span {
-        span.with_def_site_ctxt(self.current_expansion.id)
+        span.with_def_site_ctxt(self.current_expansion.id.to_expn_id())
     }
 
     /// Equivalent of `Span::call_site` from the proc macro API,
     /// except that the location is taken from the span passed as an argument.
     pub fn with_call_site_ctxt(&self, span: Span) -> Span {
-        span.with_call_site_ctxt(self.current_expansion.id)
+        span.with_call_site_ctxt(self.current_expansion.id.to_expn_id())
     }
 
     /// Equivalent of `Span::mixed_site` from the proc macro API,
     /// except that the location is taken from the span passed as an argument.
     pub fn with_mixed_site_ctxt(&self, span: Span) -> Span {
-        span.with_mixed_site_ctxt(self.current_expansion.id)
+        span.with_mixed_site_ctxt(self.current_expansion.id.to_expn_id())
     }
 
     /// Returns span for the macro which originally caused the current expansion to happen.
@@ -1094,7 +1122,7 @@ impl<'a> ExtCtxt<'a> {
                         span,
                         &format!(
                             "cannot resolve relative path in non-file source `{}`",
-                            other.prefer_local()
+                            self.source_map().filename_for_diagnostics(&other)
                         ),
                     ));
                 }
@@ -1109,13 +1137,15 @@ impl<'a> ExtCtxt<'a> {
 }
 
 /// Extracts a string literal from the macro expanded version of `expr`,
-/// emitting `err_msg` if `expr` is not a string literal. This does not stop
-/// compilation on error, merely emits a non-fatal error and returns `None`.
+/// returning a diagnostic error of `err_msg` if `expr` is not a string literal.
+/// The returned bool indicates whether an applicable suggestion has already been
+/// added to the diagnostic to avoid emitting multiple suggestions. `Err(None)`
+/// indicates that an ast error was encountered.
 pub fn expr_to_spanned_string<'a>(
     cx: &'a mut ExtCtxt<'_>,
     expr: P<ast::Expr>,
     err_msg: &str,
-) -> Result<(Symbol, ast::StrStyle, Span), Option<DiagnosticBuilder<'a>>> {
+) -> Result<(Symbol, ast::StrStyle, Span), Option<(DiagnosticBuilder<'a>, bool)>> {
     // Perform eager expansion on the expression.
     // We want to be able to handle e.g., `concat!("foo", "bar")`.
     let expr = cx.expander().fully_expand_fragment(AstFragment::Expr(expr)).make_expr();
@@ -1123,14 +1153,27 @@ pub fn expr_to_spanned_string<'a>(
     Err(match expr.kind {
         ast::ExprKind::Lit(ref l) => match l.kind {
             ast::LitKind::Str(s, style) => return Ok((s, style, expr.span)),
+            ast::LitKind::ByteStr(_) => {
+                let mut err = cx.struct_span_err(l.span, err_msg);
+                err.span_suggestion(
+                    expr.span.shrink_to_lo(),
+                    "consider removing the leading `b`",
+                    String::new(),
+                    Applicability::MaybeIncorrect,
+                );
+                Some((err, true))
+            }
             ast::LitKind::Err(_) => None,
-            _ => Some(cx.struct_span_err(l.span, err_msg)),
+            _ => Some((cx.struct_span_err(l.span, err_msg), false)),
         },
         ast::ExprKind::Err => None,
-        _ => Some(cx.struct_span_err(expr.span, err_msg)),
+        _ => Some((cx.struct_span_err(expr.span, err_msg), false)),
     })
 }
 
+/// Extracts a string literal from the macro expanded version of `expr`,
+/// emitting `err_msg` if `expr` is not a string literal. This does not stop
+/// compilation on error, merely emits a non-fatal error and returns `None`.
 pub fn expr_to_string(
     cx: &mut ExtCtxt<'_>,
     expr: P<ast::Expr>,
@@ -1138,7 +1181,7 @@ pub fn expr_to_string(
 ) -> Option<(Symbol, ast::StrStyle)> {
     expr_to_spanned_string(cx, expr, err_msg)
         .map_err(|err| {
-            err.map(|mut err| {
+            err.map(|(mut err, _)| {
                 err.emit();
             })
         })
@@ -1217,6 +1260,88 @@ pub fn get_exprs_from_tts(
         }
     }
     Some(es)
+}
+
+pub fn parse_macro_name_and_helper_attrs(
+    diag: &rustc_errors::Handler,
+    attr: &Attribute,
+    descr: &str,
+) -> Option<(Symbol, Vec<Symbol>)> {
+    // Once we've located the `#[proc_macro_derive]` attribute, verify
+    // that it's of the form `#[proc_macro_derive(Foo)]` or
+    // `#[proc_macro_derive(Foo, attributes(A, ..))]`
+    let list = match attr.meta_item_list() {
+        Some(list) => list,
+        None => return None,
+    };
+    if list.len() != 1 && list.len() != 2 {
+        diag.span_err(attr.span, "attribute must have either one or two arguments");
+        return None;
+    }
+    let trait_attr = match list[0].meta_item() {
+        Some(meta_item) => meta_item,
+        _ => {
+            diag.span_err(list[0].span(), "not a meta item");
+            return None;
+        }
+    };
+    let trait_ident = match trait_attr.ident() {
+        Some(trait_ident) if trait_attr.is_word() => trait_ident,
+        _ => {
+            diag.span_err(trait_attr.span, "must only be one word");
+            return None;
+        }
+    };
+
+    if !trait_ident.name.can_be_raw() {
+        diag.span_err(
+            trait_attr.span,
+            &format!("`{}` cannot be a name of {} macro", trait_ident, descr),
+        );
+    }
+
+    let attributes_attr = list.get(1);
+    let proc_attrs: Vec<_> = if let Some(attr) = attributes_attr {
+        if !attr.has_name(sym::attributes) {
+            diag.span_err(attr.span(), "second argument must be `attributes`")
+        }
+        attr.meta_item_list()
+            .unwrap_or_else(|| {
+                diag.span_err(attr.span(), "attribute must be of form: `attributes(foo, bar)`");
+                &[]
+            })
+            .iter()
+            .filter_map(|attr| {
+                let attr = match attr.meta_item() {
+                    Some(meta_item) => meta_item,
+                    _ => {
+                        diag.span_err(attr.span(), "not a meta item");
+                        return None;
+                    }
+                };
+
+                let ident = match attr.ident() {
+                    Some(ident) if attr.is_word() => ident,
+                    _ => {
+                        diag.span_err(attr.span, "must only be one word");
+                        return None;
+                    }
+                };
+                if !ident.name.can_be_raw() {
+                    diag.span_err(
+                        attr.span,
+                        &format!("`{}` cannot be a name of derive helper attribute", ident),
+                    );
+                }
+
+                Some(ident.name)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Some((trait_ident.name, proc_attrs))
 }
 
 /// This nonterminal looks like some specific enums from

@@ -13,16 +13,16 @@ use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::sym;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for usages of `Err(x)?`.
+    /// ### What it does
+    /// Checks for usages of `Err(x)?`.
     ///
-    /// **Why is this bad?** The `?` operator is designed to allow calls that
+    /// ### Why is this bad?
+    /// The `?` operator is designed to allow calls that
     /// can fail to be easily chained. For example, `foo()?.bar()` or
     /// `foo(bar()?)`. Because `Err(x)?` can't be used that way (it will
     /// always return), it is more clear to write `return Err(x)`.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust
     /// fn foo(fail: bool) -> Result<i32, String> {
     ///     if fail {
@@ -143,7 +143,7 @@ fn find_return_type<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx ExprKind<'_>) -> O
 fn result_error_type<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
     if_chain! {
         if let ty::Adt(_, subst) = ty.kind();
-        if is_type_diagnostic_item(cx, ty, sym::result_type);
+        if is_type_diagnostic_item(cx, ty, sym::Result);
         then {
             Some(subst.type_at(1))
         } else {
@@ -160,7 +160,7 @@ fn poll_result_error_type<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<
         let ready_ty = subst.type_at(0);
 
         if let ty::Adt(ready_def, ready_subst) = ready_ty.kind();
-        if cx.tcx.is_diagnostic_item(sym::result_type, ready_def.did);
+        if cx.tcx.is_diagnostic_item(sym::Result, ready_def.did);
         then {
             Some(ready_subst.type_at(1))
         } else {
@@ -177,11 +177,11 @@ fn poll_option_result_error_type<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> 
         let ready_ty = subst.type_at(0);
 
         if let ty::Adt(ready_def, ready_subst) = ready_ty.kind();
-        if cx.tcx.is_diagnostic_item(sym::option_type, ready_def.did);
+        if cx.tcx.is_diagnostic_item(sym::Option, ready_def.did);
         let some_ty = ready_subst.type_at(0);
 
         if let ty::Adt(some_def, some_subst) = some_ty.kind();
-        if cx.tcx.is_diagnostic_item(sym::result_type, some_def.did);
+        if cx.tcx.is_diagnostic_item(sym::Result, some_def.did);
         then {
             Some(some_subst.type_at(1))
         } else {

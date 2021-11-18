@@ -55,6 +55,8 @@ fn main() {
             }
         }
 
+        check!(target_specific_tests, &src_path);
+
         // Checks that are done on the cargo workspace.
         check!(deps, &root_path, &cargo);
         check!(extdeps, &root_path);
@@ -69,6 +71,7 @@ fn main() {
 
         // Checks that only make sense for the std libs.
         check!(pal, &library_path);
+        check!(primitive_docs, &library_path);
 
         // Checks that need to be done for both the compiler and std libraries.
         check!(unit_tests, &src_path);

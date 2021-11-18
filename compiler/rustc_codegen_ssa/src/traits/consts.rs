@@ -26,7 +26,9 @@ pub trait ConstMethods<'tcx>: BackendTypes {
     fn const_to_opt_uint(&self, v: Self::Value) -> Option<u64>;
     fn const_to_opt_u128(&self, v: Self::Value, sign_ext: bool) -> Option<u128>;
 
-    fn scalar_to_backend(&self, cv: Scalar, layout: &abi::Scalar, llty: Self::Type) -> Self::Value;
+    fn const_data_from_alloc(&self, alloc: &Allocation) -> Self::Value;
+
+    fn scalar_to_backend(&self, cv: Scalar, layout: abi::Scalar, llty: Self::Type) -> Self::Value;
     fn from_const_alloc(
         &self,
         layout: TyAndLayout<'tcx>,

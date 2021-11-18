@@ -1,19 +1,18 @@
 #![crate_type = "bin"]
 #![feature(lang_items)]
-#![feature(const_panic)]
 #![no_main]
 #![no_std]
 
 use core::panic::PanicInfo;
 
 const Z: () = panic!("cheese");
-//~^ ERROR any use of this value will cause an error
+//~^ ERROR evaluation of constant value failed
 
 const Y: () = unreachable!();
-//~^ ERROR any use of this value will cause an error
+//~^ ERROR evaluation of constant value failed
 
 const X: () = unimplemented!();
-//~^ ERROR any use of this value will cause an error
+//~^ ERROR evaluation of constant value failed
 
 #[lang = "eh_personality"]
 fn eh() {}

@@ -1,12 +1,17 @@
-use rustc_ast::ast::AttrStyle;
+use rustc_ast::ast::{self, AttrStyle};
 use rustc_ast::token::{self, CommentKind, Token, TokenKind};
 use rustc_ast::tokenstream::{Spacing, TokenStream};
+use rustc_ast::util::unicode::contains_text_flow_control_chars;
 use rustc_errors::{error_code, Applicability, DiagnosticBuilder, FatalError, PResult};
 use rustc_lexer::unescape::{self, Mode};
 use rustc_lexer::{Base, DocStyle, RawStrError};
+use rustc_session::lint::builtin::{
+    RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX, TEXT_DIRECTION_CODEPOINT_IN_COMMENT,
+};
+use rustc_session::lint::BuiltinLintDiagnostics;
 use rustc_session::parse::ParseSess;
 use rustc_span::symbol::{sym, Symbol};
-use rustc_span::{BytePos, Pos, Span};
+use rustc_span::{edition::Edition, BytePos, Pos, Span};
 
 use tracing::debug;
 
@@ -127,6 +132,24 @@ impl<'a> StringReader<'a> {
             .struct_span_fatal(self.mk_sp(from_pos, to_pos), &format!("{}: {}", m, escaped_char(c)))
     }
 
+    /// Detect usages of Unicode codepoints changing the direction of the text on screen and loudly
+    /// complain about it.
+    fn lint_unicode_text_flow(&self, start: BytePos) {
+        // Opening delimiter of the length 2 is not included into the comment text.
+        let content_start = start + BytePos(2);
+        let content = self.str_from(content_start);
+        if contains_text_flow_control_chars(content) {
+            let span = self.mk_sp(start, self.pos);
+            self.sess.buffer_lint_with_diagnostic(
+                &TEXT_DIRECTION_CODEPOINT_IN_COMMENT,
+                span,
+                ast::CRATE_NODE_ID,
+                "unicode codepoint changing visible direction of text present in comment",
+                BuiltinLintDiagnostics::UnicodeTextFlow(span, content.to_string()),
+            );
+        }
+    }
+
     /// Turns simple `rustc_lexer::TokenKind` enum into a rich
     /// `rustc_ast::TokenKind`. This turns strings into interned
     /// symbols and runs additional validation.
@@ -134,7 +157,12 @@ impl<'a> StringReader<'a> {
         Some(match token {
             rustc_lexer::TokenKind::LineComment { doc_style } => {
                 // Skip non-doc comments
-                let doc_style = doc_style?;
+                let doc_style = if let Some(doc_style) = doc_style {
+                    doc_style
+                } else {
+                    self.lint_unicode_text_flow(start);
+                    return None;
+                };
 
                 // Opening delimiter of the length 3 is not included into the symbol.
                 let content_start = start + BytePos(3);
@@ -156,7 +184,12 @@ impl<'a> StringReader<'a> {
                 }
 
                 // Skip non-doc comments
-                let doc_style = doc_style?;
+                let doc_style = if let Some(doc_style) = doc_style {
+                    doc_style
+                } else {
+                    self.lint_unicode_text_flow(start);
+                    return None;
+                };
 
                 // Opening delimiter of the length 3 and closing delimiter of the length 2
                 // are not included into the symbol.
@@ -166,11 +199,17 @@ impl<'a> StringReader<'a> {
                 self.cook_doc_comment(content_start, content, CommentKind::Block, doc_style)
             }
             rustc_lexer::TokenKind::Whitespace => return None,
-            rustc_lexer::TokenKind::Ident | rustc_lexer::TokenKind::RawIdent => {
+            rustc_lexer::TokenKind::Ident
+            | rustc_lexer::TokenKind::RawIdent
+            | rustc_lexer::TokenKind::UnknownPrefix => {
                 let is_raw_ident = token == rustc_lexer::TokenKind::RawIdent;
+                let is_unknown_prefix = token == rustc_lexer::TokenKind::UnknownPrefix;
                 let mut ident_start = start;
                 if is_raw_ident {
                     ident_start = ident_start + BytePos(2);
+                }
+                if is_unknown_prefix {
+                    self.report_unknown_prefix(start);
                 }
                 let sym = nfc_normalize(self.str_from(ident_start));
                 let span = self.mk_sp(start, self.pos);
@@ -489,6 +528,50 @@ impl<'a> StringReader<'a> {
 
         err.emit();
         FatalError.raise()
+    }
+
+    // RFC 3101 introduced the idea of (reserved) prefixes. As of Rust 2021,
+    // using a (unknown) prefix is an error. In earlier editions, however, they
+    // only result in a (allowed by default) lint, and are treated as regular
+    // identifier tokens.
+    fn report_unknown_prefix(&self, start: BytePos) {
+        let prefix_span = self.mk_sp(start, self.pos);
+        let prefix_str = self.str_from_to(start, self.pos);
+        let msg = format!("prefix `{}` is unknown", prefix_str);
+
+        let expn_data = prefix_span.ctxt().outer_expn_data();
+
+        if expn_data.edition >= Edition::Edition2021 {
+            // In Rust 2021, this is a hard error.
+            let mut err = self.sess.span_diagnostic.struct_span_err(prefix_span, &msg);
+            err.span_label(prefix_span, "unknown prefix");
+            if prefix_str == "rb" {
+                err.span_suggestion_verbose(
+                    prefix_span,
+                    "use `br` for a raw byte string",
+                    "br".to_string(),
+                    Applicability::MaybeIncorrect,
+                );
+            } else if expn_data.is_root() {
+                err.span_suggestion_verbose(
+                    prefix_span.shrink_to_hi(),
+                    "consider inserting whitespace here",
+                    " ".into(),
+                    Applicability::MaybeIncorrect,
+                );
+            }
+            err.note("prefixed identifiers and literals are reserved since Rust 2021");
+            err.emit();
+        } else {
+            // Before Rust 2021, only emit a lint for migration.
+            self.sess.buffer_lint_with_diagnostic(
+                &RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
+                prefix_span,
+                ast::CRATE_NODE_ID,
+                &msg,
+                BuiltinLintDiagnostics::ReservedPrefix(prefix_span),
+            );
+        }
     }
 
     /// Note: It was decided to not add a test case, because it would be too big.

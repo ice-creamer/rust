@@ -113,6 +113,7 @@ pub struct VarsOs {
 /// ```
 ///
 /// [`env::vars_os()`]: vars_os
+#[must_use]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn vars() -> Vars {
     Vars { inner: vars_os() }
@@ -140,6 +141,7 @@ pub fn vars() -> Vars {
 ///     println!("{:?}: {:?}", key, value);
 /// }
 /// ```
+#[must_use]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn vars_os() -> VarsOs {
     VarsOs { inner: os_imp::env() }
@@ -185,15 +187,13 @@ impl fmt::Debug for VarsOs {
 ///
 /// # Errors
 ///
-/// Errors if the environment variable is not present.
-/// Errors if the environment variable is not valid Unicode. If this is not desired, consider using
-/// [`var_os`].
+/// This function will return an error if the environment variable isn't set.
 ///
-/// # Panics
+/// This function may return an error if the environment variable's name contains
+/// the equal sign character (`=`) or the NUL character.
 ///
-/// This function may panic if `key` is empty, contains an ASCII equals sign
-/// `'='` or the NUL character `'\0'`, or when the value contains the NUL
-/// character.
+/// This function will return an error if the environment variable's value is
+/// not valid Unicode. If this is not desired, consider using [`var_os`].
 ///
 /// # Examples
 ///
@@ -219,17 +219,21 @@ fn _var(key: &OsStr) -> Result<String, VarError> {
 }
 
 /// Fetches the environment variable `key` from the current process, returning
-/// [`None`] if the variable isn't set.
-///
-/// # Panics
-///
-/// This function may panic if `key` is empty, contains an ASCII equals sign
-/// `'='` or the NUL character `'\0'`, or when the value contains the NUL
-/// character.
+/// [`None`] if the variable isn't set or there's another error.
 ///
 /// Note that the method will not check if the environment variable
 /// is valid Unicode. If you want to have an error on invalid UTF-8,
 /// use the [`var`] function instead.
+///
+/// # Errors
+///
+/// This function returns an error if the environment variable isn't set.
+///
+/// This function may return an error if the environment variable's name contains
+/// the equal sign character (`=`) or the NUL character.
+///
+/// This function may return an error if the environment variable's value contains
+/// the NUL character.
 ///
 /// # Examples
 ///
@@ -242,6 +246,7 @@ fn _var(key: &OsStr) -> Result<String, VarError> {
 ///     None => println!("{} is not defined in the environment.", key)
 /// }
 /// ```
+#[must_use]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     _var_os(key.as_ref())
@@ -249,7 +254,6 @@ pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
 
 fn _var_os(key: &OsStr) -> Option<OsString> {
     os_imp::getenv(key)
-        .unwrap_or_else(|e| panic!("failed to get environment variable `{:?}`: {}", key, e))
 }
 
 /// The error type for operations interacting with environment variables.
@@ -294,7 +298,7 @@ impl Error for VarError {
     }
 }
 
-/// Sets the environment variable `k` to the value `v` for the currently running
+/// Sets the environment variable `key` to the value `value` for the currently running
 /// process.
 ///
 /// Note that while concurrent access to environment variables is safe in Rust,
@@ -305,14 +309,13 @@ impl Error for VarError {
 ///
 /// Discussion of this unsafety on Unix may be found in:
 ///
-///  - [Austin Group Bugzilla](http://austingroupbugs.net/view.php?id=188)
+///  - [Austin Group Bugzilla](https://austingroupbugs.net/view.php?id=188)
 ///  - [GNU C library Bugzilla](https://sourceware.org/bugzilla/show_bug.cgi?id=15607#c2)
 ///
 /// # Panics
 ///
-/// This function may panic if `key` is empty, contains an ASCII equals sign
-/// `'='` or the NUL character `'\0'`, or when the value contains the NUL
-/// character.
+/// This function may panic if `key` is empty, contains an ASCII equals sign `'='`
+/// or the NUL character `'\0'`, or when `value` contains the NUL character.
 ///
 /// # Examples
 ///
@@ -344,7 +347,7 @@ fn _set_var(key: &OsStr, value: &OsStr) {
 ///
 /// Discussion of this unsafety on Unix may be found in:
 ///
-///  - [Austin Group Bugzilla](http://austingroupbugs.net/view.php?id=188)
+///  - [Austin Group Bugzilla](https://austingroupbugs.net/view.php?id=188)
 ///  - [GNU C library Bugzilla](https://sourceware.org/bugzilla/show_bug.cgi?id=15607#c2)
 ///
 /// # Panics
@@ -384,6 +387,7 @@ fn _remove_var(key: &OsStr) {
 /// documentation for more.
 ///
 /// [`env::split_paths()`]: split_paths
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "env", since = "1.0.0")]
 pub struct SplitPaths<'a> {
     inner: os_imp::SplitPaths<'a>,
@@ -564,6 +568,7 @@ impl Error for JoinPathsError {
     reason = "This function's behavior is unexpected and probably not what you want. \
               Consider using a crate from crates.io instead."
 )]
+#[must_use]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn home_dir() -> Option<PathBuf> {
     os_imp::home_dir()
@@ -603,6 +608,7 @@ pub fn home_dir() -> Option<PathBuf> {
 ///     println!("Temporary directory: {}", dir.display());
 /// }
 /// ```
+#[must_use]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn temp_dir() -> PathBuf {
     os_imp::temp_dir()
@@ -615,6 +621,9 @@ pub fn temp_dir() -> PathBuf {
 /// If the executable was invoked through a symbolic link, some platforms will
 /// return the path of the symbolic link and other platforms will return the
 /// path of the symbolic link’s target.
+///
+/// If the executable is renamed while it is running, platforms may return the
+/// path at the time it was loaded instead of the new path.
 ///
 /// # Errors
 ///
@@ -683,10 +692,11 @@ pub fn current_exe() -> io::Result<PathBuf> {
 /// for more.
 ///
 /// The first element is traditionally the path of the executable, but it can be
-/// set to arbitrary text, and may not even exist. This means this property
+/// set to arbitrary text, and might not even exist. This means this property
 /// should not be relied upon for security purposes.
 ///
 /// [`env::args()`]: args
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "env", since = "1.0.0")]
 pub struct Args {
     inner: ArgsOs,
@@ -699,10 +709,11 @@ pub struct Args {
 /// for more.
 ///
 /// The first element is traditionally the path of the executable, but it can be
-/// set to arbitrary text, and may not even exist. This means this property
+/// set to arbitrary text, and might not even exist. This means this property
 /// should not be relied upon for security purposes.
 ///
 /// [`env::args_os()`]: args_os
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "env", since = "1.0.0")]
 pub struct ArgsOs {
     inner: sys::args::Args,
@@ -712,7 +723,7 @@ pub struct ArgsOs {
 /// via the command line).
 ///
 /// The first element is traditionally the path of the executable, but it can be
-/// set to arbitrary text, and may not even exist. This means this property should
+/// set to arbitrary text, and might not even exist. This means this property should
 /// not be relied upon for security purposes.
 ///
 /// On Unix systems the shell usually expands unquoted arguments with glob patterns
@@ -749,7 +760,7 @@ pub fn args() -> Args {
 /// via the command line).
 ///
 /// The first element is traditionally the path of the executable, but it can be
-/// set to arbitrary text, and may not even exist. This means this property should
+/// set to arbitrary text, and might not even exist. This means this property should
 /// not be relied upon for security purposes.
 ///
 /// On Unix systems the shell usually expands unquoted arguments with glob patterns
@@ -876,6 +887,7 @@ pub mod consts {
     /// - x86_64
     /// - arm
     /// - aarch64
+    /// - m68k
     /// - mips
     /// - mips64
     /// - powerpc

@@ -2,7 +2,7 @@
 
 use crate::{
     fmt,
-    iter::{self, ExactSizeIterator, FusedIterator, TrustedLen, TrustedRandomAccess},
+    iter::{self, ExactSizeIterator, FusedIterator, TrustedLen},
     mem::{self, MaybeUninit},
     ops::Range,
     ptr,
@@ -10,6 +10,7 @@ use crate::{
 
 /// A by-value [array] iterator.
 #[stable(feature = "array_value_iter", since = "1.51.0")]
+#[rustc_insignificant_dtor]
 pub struct IntoIter<T, const N: usize> {
     /// This is the array we are iterating over.
     ///
@@ -37,7 +38,7 @@ impl<T, const N: usize> IntoIter<T, N> {
     /// Creates a new iterator over the given `array`.
     ///
     /// *Note*: this method might be deprecated in the future,
-    /// after [`IntoIterator` is implemented for arrays][array-into-iter].
+    /// since [`IntoIterator`] is now implemented for arrays.
     ///
     /// # Examples
     ///
@@ -45,11 +46,16 @@ impl<T, const N: usize> IntoIter<T, N> {
     /// use std::array;
     ///
     /// for value in array::IntoIter::new([1, 2, 3, 4, 5]) {
-    ///     // The type of `value` is a `i32` here, instead of `&i32`
+    ///     // The type of `value` is an `i32` here, instead of `&i32`
+    ///     let _: i32 = value;
+    /// }
+    ///
+    /// // Since Rust 1.53, arrays implement IntoIterator directly:
+    /// for value in [1, 2, 3, 4, 5] {
+    ///     // The type of `value` is an `i32` here, instead of `&i32`
     ///     let _: i32 = value;
     /// }
     /// ```
-    /// [array-into-iter]: https://github.com/rust-lang/rust/pull/65819
     #[stable(feature = "array_value_iter", since = "1.51.0")]
     pub fn new(array: [T; N]) -> Self {
         // SAFETY: The transmute here is actually safe. The docs of `MaybeUninit`
@@ -123,24 +129,26 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
         (len, Some(len))
     }
 
+    #[inline]
+    fn fold<Acc, Fold>(mut self, init: Acc, mut fold: Fold) -> Acc
+    where
+        Fold: FnMut(Acc, Self::Item) -> Acc,
+    {
+        let data = &mut self.data;
+        self.alive.by_ref().fold(init, |acc, idx| {
+            // SAFETY: idx is obtained by folding over the `alive` range, which implies the
+            // value is currently considered alive but as the range is being consumed each value
+            // we read here will only be read once and then considered dead.
+            fold(acc, unsafe { data.get_unchecked(idx).assume_init_read() })
+        })
+    }
+
     fn count(self) -> usize {
         self.len()
     }
 
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
-    }
-
-    #[inline]
-    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> Self::Item
-    where
-        Self: TrustedRandomAccess,
-    {
-        // SAFETY: Callers are only allowed to pass an index that is in bounds
-        // Additionally Self: TrustedRandomAccess is only implemented for T: Copy which means even
-        // multiple repeated reads of the same index would be safe and the
-        // values are !Drop, thus won't suffer from double drops.
-        unsafe { self.data.get_unchecked(self.alive.start + idx).assume_init_read() }
     }
 }
 
@@ -195,17 +203,6 @@ impl<T, const N: usize> FusedIterator for IntoIter<T, N> {}
 // always decremented by 1 in those methods, but only if `Some(_)` is returned.
 #[stable(feature = "array_value_iter_impls", since = "1.40.0")]
 unsafe impl<T, const N: usize> TrustedLen for IntoIter<T, N> {}
-
-#[doc(hidden)]
-#[unstable(feature = "trusted_random_access", issue = "none")]
-// T: Copy as approximation for !Drop since get_unchecked does not update the pointers
-// and thus we can't implement drop-handling
-unsafe impl<T, const N: usize> TrustedRandomAccess for IntoIter<T, N>
-where
-    T: Copy,
-{
-    const MAY_HAVE_SIDE_EFFECT: bool = false;
-}
 
 #[stable(feature = "array_value_iter_impls", since = "1.40.0")]
 impl<T: Clone, const N: usize> Clone for IntoIter<T, N> {

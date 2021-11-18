@@ -17,21 +17,25 @@ use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::Span;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for address of operations (`&`) that are going to
+    /// ### What it does
+    /// Checks for address of operations (`&`) that are going to
     /// be dereferenced immediately by the compiler.
     ///
-    /// **Why is this bad?** Suggests that the receiver of the expression borrows
+    /// ### Why is this bad?
+    /// Suggests that the receiver of the expression borrows
     /// the expression.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust
+    /// fn fun(_a: &i32) {}
+    ///
     /// // Bad
     /// let x: &i32 = &&&&&&5;
+    /// fun(&x);
     ///
     /// // Good
     /// let x: &i32 = &5;
+    /// fun(x);
     /// ```
     pub NEEDLESS_BORROW,
     style,
@@ -39,13 +43,13 @@ declare_clippy_lint! {
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for `ref` bindings which create a reference to a reference.
+    /// ### What it does
+    /// Checks for `ref` bindings which create a reference to a reference.
     ///
-    /// **Why is this bad?** The address-of operator at the use site is clearer about the need for a reference.
+    /// ### Why is this bad?
+    /// The address-of operator at the use site is clearer about the need for a reference.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust
     /// // Bad
     /// let x = Some("");
@@ -100,26 +104,36 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBorrow {
         if e.span.from_expansion() {
             return;
         }
-        if let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, inner) = e.kind {
+        if let ExprKind::AddrOf(BorrowKind::Ref, mutability, inner) = e.kind {
             if let ty::Ref(_, ty, _) = cx.typeck_results().expr_ty(inner).kind() {
                 for adj3 in cx.typeck_results().expr_adjustments(e).windows(3) {
-                    if let [Adjustment {
-                        kind: Adjust::Deref(_), ..
-                    }, Adjustment {
-                        kind: Adjust::Deref(_), ..
-                    }, Adjustment {
-                        kind: Adjust::Borrow(_),
-                        ..
-                    }] = *adj3
+                    if let [
+                        Adjustment {
+                            kind: Adjust::Deref(_), ..
+                        },
+                        Adjustment {
+                            kind: Adjust::Deref(_), ..
+                        },
+                        Adjustment {
+                            kind: Adjust::Borrow(_),
+                            ..
+                        },
+                    ] = *adj3
                     {
+                        let help_msg_ty = if matches!(mutability, Mutability::Not) {
+                            format!("&{}", ty)
+                        } else {
+                            format!("&mut {}", ty)
+                        };
+
                         span_lint_and_then(
                             cx,
                             NEEDLESS_BORROW,
                             e.span,
                             &format!(
-                                "this expression borrows a reference (`&{}`) that is immediately dereferenced \
+                                "this expression borrows a reference (`{}`) that is immediately dereferenced \
                              by the compiler",
-                                ty
+                                help_msg_ty
                             ),
                             |diag| {
                                 if let Some(snippet) = snippet_opt(cx, inner.span) {

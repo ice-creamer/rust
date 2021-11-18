@@ -51,7 +51,6 @@ pub struct Feature {
     pub since: &'static str,
     issue: Option<NonZeroU32>,
     pub edition: Option<Edition>,
-    description: &'static str,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -146,7 +145,7 @@ pub fn find_feature_issue(feature: Symbol, issue: GateIssue) -> Option<NonZeroU3
 }
 
 pub use accepted::ACCEPTED_FEATURES;
-pub use active::{Features, ACTIVE_FEATURES, INCOMPATIBLE_FEATURES, INCOMPLETE_FEATURES};
+pub use active::{Features, ACTIVE_FEATURES, INCOMPATIBLE_FEATURES};
 pub use builtin_attrs::{
     deprecated_attributes, find_gated_cfg, is_builtin_attr_name, AttributeGate, AttributeTemplate,
     AttributeType, BuiltinAttribute, GatedCfg, BUILTIN_ATTRIBUTES, BUILTIN_ATTRIBUTE_MAP,

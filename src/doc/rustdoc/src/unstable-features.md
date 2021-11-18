@@ -131,6 +131,31 @@ Book][unstable-masked] and [its tracking issue][issue-masked].
 [unstable-masked]: ../unstable-book/language-features/doc-masked.html
 [issue-masked]: https://github.com/rust-lang/rust/issues/44027
 
+
+## Document primitives
+
+This is for Rust compiler internal use only.
+
+Since primitive types are defined in the compiler, there's no place to attach documentation
+attributes. The `#[doc(primitive)]` attribute is used by the standard library to provide a way
+to generate documentation for primitive types, and requires `#![feature(doc_primitive)]` to enable.
+
+## Document keywords
+
+This is for Rust compiler internal use only.
+
+Rust keywords are documented in the standard library (look for `match` for example).
+
+To do so, the `#[doc(keyword = "...")]` attribute is used. Example:
+
+```rust
+#![feature(doc_keyword)]
+
+/// Some documentation about the keyword.
+#[doc(keyword = "keyword")]
+mod empty_mod {}
+```
+
 ## Unstable command-line arguments
 
 These features are enabled by passing a command-line flag to Rustdoc, but the flags in question are
@@ -202,6 +227,22 @@ some consideration for their stability, and names that end in a number). Giving 
 `rustdoc` will disable this sorting and instead make it print the items in the order they appear in
 the source.
 
+### `--show-type-layout`: add a section to each type's docs describing its memory layout
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs -Z unstable-options --show-type-layout
+```
+
+When this flag is passed, rustdoc will add a "Layout" section at the bottom of
+each type's docs page that includes a summary of the type's memory layout as
+computed by rustc. For example, rustdoc will show the size in bytes that a value
+of that type will take in memory.
+
+Note that most layout information is **completely unstable** and may even differ
+between compilations.
+
 ### `--resource-suffix`: modifying the name of CSS/JavaScript in crate docs
 
 Using this flag looks like this:
@@ -215,13 +256,13 @@ all these files are linked from every page, changing where they are can be cumbe
 specially cache them. This flag will rename all these files in the output to include the suffix in
 the filename. For example, `light.css` would become `light-suf.css` with the above command.
 
-### `--display-warnings`: display warnings when documenting or running documentation tests
+### `--display-doctest-warnings`: display warnings when documenting or running documentation tests
 
 Using this flag looks like this:
 
 ```bash
-$ rustdoc src/lib.rs -Z unstable-options --display-warnings
-$ rustdoc --test src/lib.rs -Z unstable-options --display-warnings
+$ rustdoc src/lib.rs -Z unstable-options --display-doctest-warnings
+$ rustdoc --test src/lib.rs -Z unstable-options --display-doctest-warnings
 ```
 
 The intent behind this flag is to allow the user to see warnings that occur within their library or
@@ -326,7 +367,7 @@ Some methodology notes about what rustdoc counts in this metric:
 Public items that are not documented can be seen with the built-in `missing_docs` lint. Private
 items that are not documented can be seen with Clippy's `missing_docs_in_private_items` lint.
 
-## `-w`/`--output-format`: output format
+### `-w`/`--output-format`: output format
 
 When using
 [`--show-coverage`](https://doc.rust-lang.org/nightly/rustdoc/unstable-features.html#--show-coverage-get-statistics-about-code-documentation-coverage),
@@ -432,3 +473,27 @@ Calculating code examples follows these rules:
   * static
   * typedef
 2. If one of the previously listed items has a code example, then it'll be counted.
+
+### `--with-examples`: include examples of uses of items as documentation
+
+This option, combined with `--scrape-examples-target-crate` and
+`--scrape-examples-output-path`, is used to implement the functionality in [RFC
+#3123](https://github.com/rust-lang/rfcs/pull/3123). Uses of an item (currently
+functions / call-sites) are found in a crate and its reverse-dependencies, and
+then the uses are included as documentation for that item. This feature is
+intended to be used via `cargo doc --scrape-examples`, but the rustdoc-only
+workflow looks like:
+
+```bash
+$ rustdoc examples/ex.rs -Z unstable-options \
+    --extern foobar=target/deps/libfoobar.rmeta \
+    --scrape-examples-target-crate foobar \
+    --scrape-examples-output-path output.calls
+$ rustdoc src/lib.rs -Z unstable-options --with-examples output.calls
+```
+
+First, the library must be checked to generate an `rmeta`. Then a
+reverse-dependency like `examples/ex.rs` is given to rustdoc with the target
+crate being documented (`foobar`) and a path to output the calls
+(`output.calls`). Then, the generated calls file can be passed via
+`--with-examples` to the subsequent documentation of `foobar`.

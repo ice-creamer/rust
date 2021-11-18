@@ -72,6 +72,7 @@ impl Utf8Error {
     /// assert_eq!(1, error.valid_up_to());
     /// ```
     #[stable(feature = "utf8_error", since = "1.5.0")]
+    #[must_use]
     #[inline]
     pub fn valid_up_to(&self) -> usize {
         self.valid_up_to
@@ -93,6 +94,7 @@ impl Utf8Error {
     ///
     /// [U+FFFD]: ../../std/char/constant.REPLACEMENT_CHARACTER.html
     #[stable(feature = "utf8_error_error_len", since = "1.20.0")]
+    #[must_use]
     #[inline]
     pub fn error_len(&self) -> Option<usize> {
         self.error_len.map(|len| len as usize)
@@ -118,10 +120,9 @@ impl fmt::Display for Utf8Error {
 ///
 /// [`from_str`]: super::FromStr::from_str
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 #[stable(feature = "rust1", since = "1.0.0")]
-pub struct ParseBoolError {
-    pub(super) _priv: (),
-}
+pub struct ParseBoolError;
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl fmt::Display for ParseBoolError {

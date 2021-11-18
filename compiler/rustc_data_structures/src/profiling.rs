@@ -94,31 +94,36 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use measureme::{EventId, EventIdBuilder, Profiler, SerializableString, StringId};
+pub use measureme::EventId;
+use measureme::{EventIdBuilder, Profiler, SerializableString, StringId};
 use parking_lot::RwLock;
 
 bitflags::bitflags! {
     struct EventFilter: u32 {
-        const GENERIC_ACTIVITIES = 1 << 0;
-        const QUERY_PROVIDERS    = 1 << 1;
-        const QUERY_CACHE_HITS   = 1 << 2;
-        const QUERY_BLOCKED      = 1 << 3;
-        const INCR_CACHE_LOADS   = 1 << 4;
+        const GENERIC_ACTIVITIES  = 1 << 0;
+        const QUERY_PROVIDERS     = 1 << 1;
+        const QUERY_CACHE_HITS    = 1 << 2;
+        const QUERY_BLOCKED       = 1 << 3;
+        const INCR_CACHE_LOADS    = 1 << 4;
 
-        const QUERY_KEYS         = 1 << 5;
-        const FUNCTION_ARGS      = 1 << 6;
-        const LLVM               = 1 << 7;
+        const QUERY_KEYS          = 1 << 5;
+        const FUNCTION_ARGS       = 1 << 6;
+        const LLVM                = 1 << 7;
+        const INCR_RESULT_HASHING = 1 << 8;
+        const ARTIFACT_SIZES = 1 << 9;
 
         const DEFAULT = Self::GENERIC_ACTIVITIES.bits |
                         Self::QUERY_PROVIDERS.bits |
                         Self::QUERY_BLOCKED.bits |
-                        Self::INCR_CACHE_LOADS.bits;
+                        Self::INCR_CACHE_LOADS.bits |
+                        Self::INCR_RESULT_HASHING.bits |
+                        Self::ARTIFACT_SIZES.bits;
 
         const ARGS = Self::QUERY_KEYS.bits | Self::FUNCTION_ARGS.bits;
     }
 }
 
-// keep this in sync with the `-Z self-profile-events` help message in librustc_session/options.rs
+// keep this in sync with the `-Z self-profile-events` help message in rustc_session/options.rs
 const EVENT_FILTERS_BY_NAME: &[(&str, EventFilter)] = &[
     ("none", EventFilter::empty()),
     ("all", EventFilter::all()),
@@ -132,6 +137,8 @@ const EVENT_FILTERS_BY_NAME: &[(&str, EventFilter)] = &[
     ("function-args", EventFilter::FUNCTION_ARGS),
     ("args", EventFilter::ARGS),
     ("llvm", EventFilter::LLVM),
+    ("incr-result-hashing", EventFilter::INCR_RESULT_HASHING),
+    ("artifact-sizes", EventFilter::ARTIFACT_SIZES),
 ];
 
 /// Something that uniquely identifies a query invocation.
@@ -216,7 +223,7 @@ impl SelfProfilerRef {
         VerboseTimingGuard::start(message, self.generic_activity(event_label))
     }
 
-    /// Start profiling a extra verbose generic activity. Profiling continues until the
+    /// Start profiling an extra verbose generic activity. Profiling continues until the
     /// VerboseTimingGuard returned from this call is dropped. In addition to recording
     /// a measureme event, "extra verbose" generic activities also print a timing entry to
     /// stdout if the compiler is invoked with -Ztime-passes.
@@ -248,6 +255,15 @@ impl SelfProfilerRef {
         })
     }
 
+    /// Start profiling with some event filter for a given event. Profiling continues until the
+    /// TimingGuard returned from this call is dropped.
+    #[inline(always)]
+    pub fn generic_activity_with_event_id(&self, event_id: EventId) -> TimingGuard<'_> {
+        self.exec(EventFilter::GENERIC_ACTIVITIES, |profiler| {
+            TimingGuard::start(profiler, profiler.generic_activity_event_kind, event_id)
+        })
+    }
+
     /// Start profiling a generic activity. Profiling continues until the
     /// TimingGuard returned from this call is dropped.
     #[inline(always)]
@@ -270,6 +286,33 @@ impl SelfProfilerRef {
             };
             TimingGuard::start(profiler, profiler.generic_activity_event_kind, event_id)
         })
+    }
+
+    /// Record the size of an artifact that the compiler produces
+    ///
+    /// `artifact_kind` is the class of artifact (e.g., query_cache, object_file, etc.)
+    /// `artifact_name` is an identifier to the specific artifact being stored (usually a filename)
+    #[inline(always)]
+    pub fn artifact_size<A>(&self, artifact_kind: &str, artifact_name: A, size: u64)
+    where
+        A: Borrow<str> + Into<String>,
+    {
+        drop(self.exec(EventFilter::ARTIFACT_SIZES, |profiler| {
+            let builder = EventIdBuilder::new(&profiler.profiler);
+            let event_label = profiler.get_or_alloc_cached_string(artifact_kind);
+            let event_arg = profiler.get_or_alloc_cached_string(artifact_name);
+            let event_id = builder.from_label_and_arg(event_label, event_arg);
+            let thread_id = get_thread_id();
+
+            profiler.profiler.record_integer_event(
+                profiler.artifact_size_event_kind,
+                event_id,
+                thread_id,
+                size,
+            );
+
+            TimingGuard::none()
+        }))
     }
 
     #[inline(always)]
@@ -337,6 +380,19 @@ impl SelfProfilerRef {
         })
     }
 
+    /// Start profiling how long it takes to hash query results for incremental compilation.
+    /// Profiling continues until the TimingGuard returned from this call is dropped.
+    #[inline(always)]
+    pub fn incr_result_hashing(&self) -> TimingGuard<'_> {
+        self.exec(EventFilter::INCR_RESULT_HASHING, |profiler| {
+            TimingGuard::start(
+                profiler,
+                profiler.incremental_result_hashing_event_kind,
+                EventId::INVALID,
+            )
+        })
+    }
+
     #[inline(always)]
     fn instant_query_event(
         &self,
@@ -346,7 +402,7 @@ impl SelfProfilerRef {
     ) {
         drop(self.exec(event_filter, |profiler| {
             let event_id = StringId::new_virtual(query_invocation_id.0);
-            let thread_id = std::thread::current().id().as_u64().get() as u32;
+            let thread_id = get_thread_id();
 
             profiler.profiler.record_instant_event(
                 event_kind(profiler),
@@ -362,6 +418,14 @@ impl SelfProfilerRef {
         if let Some(profiler) = &self.profiler {
             f(&profiler)
         }
+    }
+
+    /// Gets a `StringId` for the given string. This method makes sure that
+    /// any strings going through it will only be allocated once in the
+    /// profiling data.
+    /// Returns `None` if the self-profiling is not enabled.
+    pub fn get_or_alloc_cached_string(&self, s: &str) -> Option<StringId> {
+        self.profiler.as_ref().map(|p| p.get_or_alloc_cached_string(s))
     }
 
     #[inline]
@@ -388,8 +452,10 @@ pub struct SelfProfiler {
     query_event_kind: StringId,
     generic_activity_event_kind: StringId,
     incremental_load_result_event_kind: StringId,
+    incremental_result_hashing_event_kind: StringId,
     query_blocked_event_kind: StringId,
     query_cache_hit_event_kind: StringId,
+    artifact_size_event_kind: StringId,
 }
 
 impl SelfProfiler {
@@ -408,8 +474,11 @@ impl SelfProfiler {
         let query_event_kind = profiler.alloc_string("Query");
         let generic_activity_event_kind = profiler.alloc_string("GenericActivity");
         let incremental_load_result_event_kind = profiler.alloc_string("IncrementalLoadResult");
+        let incremental_result_hashing_event_kind =
+            profiler.alloc_string("IncrementalResultHashing");
         let query_blocked_event_kind = profiler.alloc_string("QueryBlocked");
         let query_cache_hit_event_kind = profiler.alloc_string("QueryCacheHit");
+        let artifact_size_event_kind = profiler.alloc_string("ArtifactSize");
 
         let mut event_filter_mask = EventFilter::empty();
 
@@ -451,8 +520,10 @@ impl SelfProfiler {
             query_event_kind,
             generic_activity_event_kind,
             incremental_load_result_event_kind,
+            incremental_result_hashing_event_kind,
             query_blocked_event_kind,
             query_cache_hit_event_kind,
+            artifact_size_event_kind,
         })
     }
 
@@ -523,7 +594,7 @@ impl<'a> TimingGuard<'a> {
         event_kind: StringId,
         event_id: EventId,
     ) -> TimingGuard<'a> {
-        let thread_id = std::thread::current().id().as_u64().get() as u32;
+        let thread_id = get_thread_id();
         let raw_profiler = &profiler.profiler;
         let timing_guard =
             raw_profiler.start_recording_interval_event(event_kind, event_id, thread_id);
@@ -615,6 +686,10 @@ pub fn print_time_passes_entry(
 // to parse (always use the same number of decimal places and the same unit).
 pub fn duration_to_secs_str(dur: std::time::Duration) -> String {
     format!("{:.3}", dur.as_secs_f64())
+}
+
+fn get_thread_id() -> u32 {
+    std::thread::current().id().as_u64().get() as u32
 }
 
 // Memory reporting

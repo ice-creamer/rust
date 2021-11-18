@@ -43,7 +43,7 @@ else
     PYTHON="python2"
 fi
 
-if ! isCI || isCiBranch auto || isCiBranch beta; then
+if ! isCI || isCiBranch auto || isCiBranch beta || isCiBranch try; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.print-step-timings --enable-verbose-tests"
 fi
 
@@ -65,11 +65,7 @@ fi
 # Always set the release channel for bootstrap; this is normally not important (i.e., only dist
 # builds would seem to matter) but in practice bootstrap wants to know whether we're targeting
 # master, beta, or stable with a build to determine whether to run some checks (notably toolstate).
-if [[ -z "${RUST_CI_OVERRIDE_RELEASE_CHANNEL+x}" ]]; then
-    export RUST_RELEASE_CHANNEL="$(cat "${ci_dir}/channel")"
-else
-    export RUST_RELEASE_CHANNEL="${RUST_CI_OVERRIDE_RELEASE_CHANNEL}"
-fi
+export RUST_RELEASE_CHANNEL=$(releaseChannel)
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --release-channel=$RUST_RELEASE_CHANNEL"
 
 if [ "$DEPLOY$DEPLOY_ALT" = "1" ]; then
@@ -91,6 +87,11 @@ else
   # long for too little benefit, so we just turn them off.
   if [ "$NO_DEBUG_ASSERTIONS" = "" ]; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-debug-assertions"
+  fi
+
+  # Same for overflow checks
+  if [ "$NO_OVERFLOW_CHECKS" = "" ]; then
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-overflow-checks"
   fi
 
   # In general we always want to run tests with LLVM assertions enabled, but not
@@ -116,7 +117,7 @@ datecheck() {
   echo -n "  local time: "
   date
   echo -n "  network time: "
-  curl -fs --head http://detectportal.firefox.com/success.txt | grep ^Date: \
+  curl -fs --head http://ci-caches.rust-lang.org | grep ^Date: \
       | sed 's/Date: //g' || true
   echo "== end clock drift check =="
 }

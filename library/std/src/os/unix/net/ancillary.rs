@@ -32,23 +32,8 @@ pub(super) fn recv_vectored_with_ancillary_from(
         msg.msg_name = &mut msg_name as *mut _ as *mut _;
         msg.msg_namelen = size_of::<libc::sockaddr_un>() as libc::socklen_t;
         msg.msg_iov = bufs.as_mut_ptr().cast();
-        cfg_if::cfg_if! {
-            if #[cfg(any(target_os = "android", all(target_os = "linux", target_env = "gnu")))] {
-                msg.msg_iovlen = bufs.len() as libc::size_t;
-                msg.msg_controllen = ancillary.buffer.len() as libc::size_t;
-            } else if #[cfg(any(
-                          target_os = "dragonfly",
-                          target_os = "emscripten",
-                          target_os = "freebsd",
-                          all(target_os = "linux", target_env = "musl",),
-                          target_os = "macos",
-                          target_os = "netbsd",
-                          target_os = "openbsd",
-                      ))] {
-                msg.msg_iovlen = bufs.len() as libc::c_int;
-                msg.msg_controllen = ancillary.buffer.len() as libc::socklen_t;
-            }
-        }
+        msg.msg_iovlen = bufs.len() as _;
+        msg.msg_controllen = ancillary.buffer.len() as _;
         // macos requires that the control pointer is null when the len is 0.
         if msg.msg_controllen > 0 {
             msg.msg_control = ancillary.buffer.as_mut_ptr().cast();
@@ -80,23 +65,8 @@ pub(super) fn send_vectored_with_ancillary_to(
         msg.msg_name = &mut msg_name as *mut _ as *mut _;
         msg.msg_namelen = msg_namelen;
         msg.msg_iov = bufs.as_ptr() as *mut _;
-        cfg_if::cfg_if! {
-            if #[cfg(any(target_os = "android", all(target_os = "linux", target_env = "gnu")))] {
-                msg.msg_iovlen = bufs.len() as libc::size_t;
-                msg.msg_controllen = ancillary.length as libc::size_t;
-            } else if #[cfg(any(
-                          target_os = "dragonfly",
-                          target_os = "emscripten",
-                          target_os = "freebsd",
-                          all(target_os = "linux", target_env = "musl",),
-                          target_os = "macos",
-                          target_os = "netbsd",
-                          target_os = "openbsd",
-                      ))] {
-                msg.msg_iovlen = bufs.len() as libc::c_int;
-                msg.msg_controllen = ancillary.length as libc::socklen_t;
-            }
-        }
+        msg.msg_iovlen = bufs.len() as _;
+        msg.msg_controllen = ancillary.length as _;
         // macos requires that the control pointer is null when the len is 0.
         if msg.msg_controllen > 0 {
             msg.msg_control = ancillary.buffer.as_mut_ptr().cast();
@@ -144,21 +114,7 @@ fn add_to_ancillary_data<T>(
 
         let mut msg: libc::msghdr = zeroed();
         msg.msg_control = buffer.as_mut_ptr().cast();
-        cfg_if::cfg_if! {
-            if #[cfg(any(target_os = "android", all(target_os = "linux", target_env = "gnu")))] {
-                msg.msg_controllen = *length as libc::size_t;
-            } else if #[cfg(any(
-                          target_os = "dragonfly",
-                          target_os = "emscripten",
-                          target_os = "freebsd",
-                          all(target_os = "linux", target_env = "musl",),
-                          target_os = "macos",
-                          target_os = "netbsd",
-                          target_os = "openbsd",
-                      ))] {
-                msg.msg_controllen = *length as libc::socklen_t;
-            }
-        }
+        msg.msg_controllen = *length as _;
 
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         let mut previous_cmsg = cmsg;
@@ -180,21 +136,7 @@ fn add_to_ancillary_data<T>(
 
         (*previous_cmsg).cmsg_level = cmsg_level;
         (*previous_cmsg).cmsg_type = cmsg_type;
-        cfg_if::cfg_if! {
-            if #[cfg(any(target_os = "android", all(target_os = "linux", target_env = "gnu")))] {
-                (*previous_cmsg).cmsg_len = libc::CMSG_LEN(source_len) as libc::size_t;
-            } else if #[cfg(any(
-                          target_os = "dragonfly",
-                          target_os = "emscripten",
-                          target_os = "freebsd",
-                          all(target_os = "linux", target_env = "musl",),
-                          target_os = "macos",
-                          target_os = "netbsd",
-                          target_os = "openbsd",
-                      ))] {
-                (*previous_cmsg).cmsg_len = libc::CMSG_LEN(source_len) as libc::socklen_t;
-            }
-        }
+        (*previous_cmsg).cmsg_len = libc::CMSG_LEN(source_len) as _;
 
         let data = libc::CMSG_DATA(previous_cmsg).cast();
 
@@ -247,6 +189,7 @@ impl SocketCred {
     ///
     /// PID, UID and GID is set to 0.
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
+    #[must_use]
     pub fn new() -> SocketCred {
         SocketCred(libc::ucred { pid: 0, uid: 0, gid: 0 })
     }
@@ -258,6 +201,7 @@ impl SocketCred {
     }
 
     /// Get the current PID.
+    #[must_use]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn get_pid(&self) -> libc::pid_t {
         self.0.pid
@@ -270,6 +214,7 @@ impl SocketCred {
     }
 
     /// Get the current UID.
+    #[must_use]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn get_uid(&self) -> libc::uid_t {
         self.0.uid
@@ -282,6 +227,7 @@ impl SocketCred {
     }
 
     /// Get the current GID.
+    #[must_use]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn get_gid(&self) -> libc::gid_t {
         self.0.gid
@@ -337,7 +283,7 @@ pub enum AncillaryData<'a> {
 }
 
 impl<'a> AncillaryData<'a> {
-    /// Create a `AncillaryData::ScmRights` variant.
+    /// Create an `AncillaryData::ScmRights` variant.
     ///
     /// # Safety
     ///
@@ -349,7 +295,7 @@ impl<'a> AncillaryData<'a> {
         AncillaryData::ScmRights(scm_rights)
     }
 
-    /// Create a `AncillaryData::ScmCredentials` variant.
+    /// Create an `AncillaryData::ScmCredentials` variant.
     ///
     /// # Safety
     ///
@@ -364,28 +310,10 @@ impl<'a> AncillaryData<'a> {
 
     fn try_from_cmsghdr(cmsg: &'a libc::cmsghdr) -> Result<Self, AncillaryError> {
         unsafe {
-            cfg_if::cfg_if! {
-                if #[cfg(any(
-                        target_os = "android",
-                        all(target_os = "linux", target_env = "gnu"),
-                        all(target_os = "linux", target_env = "uclibc"),
-                   ))] {
-                    let cmsg_len_zero = libc::CMSG_LEN(0) as libc::size_t;
-                } else if #[cfg(any(
-                              target_os = "dragonfly",
-                              target_os = "emscripten",
-                              target_os = "freebsd",
-                              all(target_os = "linux", target_env = "musl",),
-                              target_os = "macos",
-                              target_os = "netbsd",
-                              target_os = "openbsd",
-                          ))] {
-                    let cmsg_len_zero = libc::CMSG_LEN(0) as libc::socklen_t;
-                }
-            }
-            let data_len = (*cmsg).cmsg_len - cmsg_len_zero;
+            let cmsg_len_zero = libc::CMSG_LEN(0) as usize;
+            let data_len = (*cmsg).cmsg_len as usize - cmsg_len_zero;
             let data = libc::CMSG_DATA(cmsg).cast();
-            let data = from_raw_parts(data, data_len as usize);
+            let data = from_raw_parts(data, data_len);
 
             match (*cmsg).cmsg_level {
                 libc::SOL_SOCKET => match (*cmsg).cmsg_type {
@@ -405,6 +333,7 @@ impl<'a> AncillaryData<'a> {
 }
 
 /// This struct is used to iterate through the control messages.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
 pub struct Messages<'a> {
     buffer: &'a [u8],
@@ -419,21 +348,7 @@ impl<'a> Iterator for Messages<'a> {
         unsafe {
             let mut msg: libc::msghdr = zeroed();
             msg.msg_control = self.buffer.as_ptr() as *mut _;
-            cfg_if::cfg_if! {
-                if #[cfg(any(target_os = "android", all(target_os = "linux", target_env = "gnu")))] {
-                    msg.msg_controllen = self.buffer.len() as libc::size_t;
-                } else if #[cfg(any(
-                              target_os = "dragonfly",
-                              target_os = "emscripten",
-                              target_os = "freebsd",
-                              all(target_os = "linux", target_env = "musl",),
-                              target_os = "macos",
-                              target_os = "netbsd",
-                              target_os = "openbsd",
-                          ))] {
-                    msg.msg_controllen = self.buffer.len() as libc::socklen_t;
-                }
-            }
+            msg.msg_controllen = self.buffer.len() as _;
 
             let cmsg = if let Some(current) = self.current {
                 libc::CMSG_NXTHDR(&msg, current)
@@ -514,18 +429,21 @@ impl<'a> SocketAncillary<'a> {
     }
 
     /// Returns the capacity of the buffer.
+    #[must_use]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn capacity(&self) -> usize {
         self.buffer.len()
     }
 
     /// Returns `true` if the ancillary data is empty.
+    #[must_use]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn is_empty(&self) -> bool {
         self.length == 0
     }
 
     /// Returns the number of used bytes.
+    #[must_use]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn len(&self) -> usize {
         self.length
@@ -560,6 +478,7 @@ impl<'a> SocketAncillary<'a> {
     ///     Ok(())
     /// }
     /// ```
+    #[must_use]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn truncated(&self) -> bool {
         self.truncated

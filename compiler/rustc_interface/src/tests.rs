@@ -5,7 +5,9 @@ use rustc_errors::{emitter::HumanReadableErrorType, registry, ColorConfig};
 use rustc_session::config::InstrumentCoverage;
 use rustc_session::config::Strip;
 use rustc_session::config::{build_configuration, build_session_options, to_crate_config};
-use rustc_session::config::{rustc_optgroups, ErrorOutputType, ExternLocation, Options, Passes};
+use rustc_session::config::{
+    rustc_optgroups, ErrorOutputType, ExternLocation, LocationDetail, Options, Passes,
+};
 use rustc_session::config::{CFGuard, ExternEntry, LinkerPluginLto, LtoCli, SwitchWithOptPath};
 use rustc_session::config::{
     Externs, OutputType, OutputTypes, SymbolManglingVersion, WasiExecModel,
@@ -96,10 +98,18 @@ fn assert_different_hash(x: &Options, y: &Options) {
     assert_same_clone(y);
 }
 
+fn assert_non_crate_hash_different(x: &Options, y: &Options) {
+    assert_eq!(x.dep_tracking_hash(true), y.dep_tracking_hash(true));
+    assert_ne!(x.dep_tracking_hash(false), y.dep_tracking_hash(false));
+    // Check clone
+    assert_same_clone(x);
+    assert_same_clone(y);
+}
+
 // When the user supplies --test we should implicitly supply --cfg test
 #[test]
 fn test_switch_implies_cfg_test() {
-    rustc_span::with_default_session_globals(|| {
+    rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["--test".to_string()]).unwrap();
         let (sess, cfg) = mk_session(matches);
         let cfg = build_configuration(&sess, to_crate_config(cfg));
@@ -110,7 +120,7 @@ fn test_switch_implies_cfg_test() {
 // When the user supplies --test and --cfg test, don't implicitly add another --cfg test
 #[test]
 fn test_switch_implies_cfg_test_unless_cfg_test() {
-    rustc_span::with_default_session_globals(|| {
+    rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["--test".to_string(), "--cfg=test".to_string()]).unwrap();
         let (sess, cfg) = mk_session(matches);
         let cfg = build_configuration(&sess, to_crate_config(cfg));
@@ -122,20 +132,20 @@ fn test_switch_implies_cfg_test_unless_cfg_test() {
 
 #[test]
 fn test_can_print_warnings() {
-    rustc_span::with_default_session_globals(|| {
+    rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["-Awarnings".to_string()]).unwrap();
         let (sess, _) = mk_session(matches);
         assert!(!sess.diagnostic().can_emit_warnings());
     });
 
-    rustc_span::with_default_session_globals(|| {
+    rustc_span::create_default_session_globals_then(|| {
         let matches =
             optgroups().parse(&["-Awarnings".to_string(), "-Dwarnings".to_string()]).unwrap();
         let (sess, _) = mk_session(matches);
         assert!(sess.diagnostic().can_emit_warnings());
     });
 
-    rustc_span::with_default_session_globals(|| {
+    rustc_span::create_default_session_globals_then(|| {
         let matches = optgroups().parse(&["-Adead_code".to_string()]).unwrap();
         let (sess, _) = mk_session(matches);
         assert!(sess.diagnostic().can_emit_warnings());
@@ -152,9 +162,9 @@ fn test_output_types_tracking_hash_different_paths() {
     v2.output_types = OutputTypes::new(&[(OutputType::Exe, Some(PathBuf::from("/some/thing")))]);
     v3.output_types = OutputTypes::new(&[(OutputType::Exe, None)]);
 
-    assert_different_hash(&v1, &v2);
-    assert_different_hash(&v1, &v3);
-    assert_different_hash(&v2, &v3);
+    assert_non_crate_hash_different(&v1, &v2);
+    assert_non_crate_hash_different(&v1, &v3);
+    assert_non_crate_hash_different(&v2, &v3);
 }
 
 #[test]
@@ -228,9 +238,9 @@ fn test_lints_tracking_hash_different_values() {
         (String::from("d"), Level::Deny),
     ];
 
-    assert_different_hash(&v1, &v2);
-    assert_different_hash(&v1, &v3);
-    assert_different_hash(&v2, &v3);
+    assert_non_crate_hash_different(&v1, &v2);
+    assert_non_crate_hash_different(&v1, &v3);
+    assert_non_crate_hash_different(&v2, &v3);
 }
 
 #[test]
@@ -253,7 +263,21 @@ fn test_lints_tracking_hash_different_construction_order() {
     ];
 
     // The hash should be order-dependent
-    assert_different_hash(&v1, &v2);
+    assert_non_crate_hash_different(&v1, &v2);
+}
+
+#[test]
+fn test_lint_cap_hash_different() {
+    let mut v1 = Options::default();
+    let mut v2 = Options::default();
+    let v3 = Options::default();
+
+    v1.lint_cap = Some(Level::Forbid);
+    v2.lint_cap = Some(Level::Allow);
+
+    assert_non_crate_hash_different(&v1, &v2);
+    assert_non_crate_hash_different(&v1, &v3);
+    assert_non_crate_hash_different(&v2, &v3);
 }
 
 #[test]
@@ -527,6 +551,7 @@ fn test_codegen_options_tracking_hash() {
     untracked!(remark, Passes::Some(vec![String::from("pass1"), String::from("pass2")]));
     untracked!(rpath, true);
     untracked!(save_temps, true);
+    untracked!(strip, Strip::Debuginfo);
 
     macro_rules! tracked {
         ($name: ident, $non_default_value: expr) => {
@@ -625,6 +650,7 @@ fn test_debugging_options_tracking_hash() {
     untracked!(dump_mir_graphviz, true);
     untracked!(emit_future_incompat_report, true);
     untracked!(emit_stack_sizes, true);
+    untracked!(future_incompat_test, true);
     untracked!(hir_stats, true);
     untracked!(identify_regions, true);
     untracked!(incremental_ignore_spans, true);
@@ -646,6 +672,7 @@ fn test_debugging_options_tracking_hash() {
     untracked!(perf_stats, true);
     // `pre_link_arg` is omitted because it just forwards to `pre_link_args`.
     untracked!(pre_link_args, vec![String::from("abc"), String::from("def")]);
+    untracked!(profile_closures, true);
     untracked!(print_link_args, true);
     untracked!(print_llvm_passes, true);
     untracked!(print_mono_items, Some(String::from("abc")));
@@ -658,7 +685,7 @@ fn test_debugging_options_tracking_hash() {
     untracked!(self_profile_events, Some(vec![String::new()]));
     untracked!(span_debug, true);
     untracked!(span_free_formats, true);
-    untracked!(strip, Strip::Debuginfo);
+    untracked!(temps_dir, Some(String::from("abc")));
     untracked!(terminal_width, Some(80));
     untracked!(threads, 99);
     untracked!(time, true);
@@ -691,6 +718,7 @@ fn test_debugging_options_tracking_hash() {
     tracked!(chalk, true);
     tracked!(codegen_backend, Some("abc".to_string()));
     tracked!(crate_attr, vec!["abc".to_string()]);
+    tracked!(debug_info_for_profiling, true);
     tracked!(debug_macros, true);
     tracked!(dep_info_omit_d_target, true);
     tracked!(dual_proc_macros, true);
@@ -707,25 +735,33 @@ fn test_debugging_options_tracking_hash() {
     tracked!(instrument_coverage, Some(InstrumentCoverage::All));
     tracked!(instrument_mcount, true);
     tracked!(link_only, true);
+    tracked!(llvm_plugins, vec![String::from("plugin_name")]);
+    tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
     tracked!(merge_functions, Some(MergeFunctions::Disabled));
     tracked!(mir_emit_retag, true);
     tracked!(mir_opt_level, Some(4));
+    tracked!(move_size_limit, Some(4096));
     tracked!(mutable_noalias, Some(true));
     tracked!(new_llvm_pass_manager, Some(true));
-    tracked!(no_codegen, true);
     tracked!(no_generate_arange_section, true);
     tracked!(no_link, true);
+    tracked!(no_unique_section_names, true);
     tracked!(no_profiler_runtime, true);
     tracked!(osx_rpath_install_name, true);
     tracked!(panic_abort_tests, true);
+    tracked!(panic_in_drop, PanicStrategy::Abort);
+    tracked!(partially_uninit_const_threshold, Some(123));
     tracked!(plt, Some(true));
     tracked!(polonius, true);
     tracked!(precise_enum_drop_elaboration, false);
     tracked!(print_fuel, Some("abc".to_string()));
     tracked!(profile, true);
     tracked!(profile_emit, Some(PathBuf::from("abc")));
+    tracked!(profiler_runtime, "abc".to_string());
+    tracked!(profile_sample_use, Some(PathBuf::from("abc")));
     tracked!(relax_elf_relocations, Some(true));
     tracked!(relro_level, Some(RelroLevel::Full));
+    tracked!(remap_cwd_prefix, Some(PathBuf::from("abc")));
     tracked!(simulate_remapped_rust_src_base, Some(PathBuf::from("/rustc/abc")));
     tracked!(report_delayed_bugs, true);
     tracked!(sanitizer, SanitizerSet::ADDRESS);
@@ -747,6 +783,16 @@ fn test_debugging_options_tracking_hash() {
     tracked!(use_ctors_section, Some(true));
     tracked!(verify_llvm_ir, true);
     tracked!(wasi_exec_model, Some(WasiExecModel::Reactor));
+
+    macro_rules! tracked_no_crate_hash {
+        ($name: ident, $non_default_value: expr) => {
+            opts = reference.clone();
+            assert_ne!(opts.debugging_opts.$name, $non_default_value);
+            opts.debugging_opts.$name = $non_default_value;
+            assert_non_crate_hash_different(&reference, &opts);
+        };
+    }
+    tracked_no_crate_hash!(no_codegen, true);
 }
 
 #[test]

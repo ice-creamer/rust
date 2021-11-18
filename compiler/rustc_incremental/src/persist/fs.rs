@@ -108,7 +108,7 @@ use rustc_data_structures::svh::Svh;
 use rustc_data_structures::{base_n, flock};
 use rustc_errors::ErrorReported;
 use rustc_fs_util::{link_or_copy, LinkOrCopy};
-use rustc_session::{CrateDisambiguator, Session};
+use rustc_session::{Session, StableCrateId};
 
 use std::fs as std_fs;
 use std::io;
@@ -138,9 +138,6 @@ pub fn dep_graph_path(sess: &Session) -> PathBuf {
 }
 pub fn staging_dep_graph_path(sess: &Session) -> PathBuf {
     in_incr_comp_dir_sess(sess, STAGING_DEP_GRAPH_FILENAME)
-}
-pub fn dep_graph_path_from(incr_comp_session_dir: &Path) -> PathBuf {
-    in_incr_comp_dir(incr_comp_session_dir, DEP_GRAPH_FILENAME)
 }
 
 pub fn work_products_path(sess: &Session) -> PathBuf {
@@ -189,7 +186,7 @@ pub fn in_incr_comp_dir(incr_comp_session_dir: &Path, file_name: &str) -> PathBu
 pub fn prepare_session_directory(
     sess: &Session,
     crate_name: &str,
-    crate_disambiguator: CrateDisambiguator,
+    stable_crate_id: StableCrateId,
 ) -> Result<(), ErrorReported> {
     if sess.opts.incremental.is_none() {
         return Ok(());
@@ -200,7 +197,7 @@ pub fn prepare_session_directory(
     debug!("prepare_session_directory");
 
     // {incr-comp-dir}/{crate-name-and-disambiguator}
-    let crate_dir = crate_path(sess, crate_name, crate_disambiguator);
+    let crate_dir = crate_path(sess, crate_name, stable_crate_id);
     debug!("crate-dir: {}", crate_dir.display());
     create_dir(sess, &crate_dir, "crate")?;
 
@@ -241,9 +238,7 @@ pub fn prepare_session_directory(
         // have already tried before.
         let source_directory = find_source_directory(&crate_dir, &source_directories_already_tried);
 
-        let source_directory = if let Some(dir) = source_directory {
-            dir
-        } else {
+        let Some(source_directory) = source_directory else {
             // There's nowhere to copy from, we're done
             debug!(
                 "no source directory found. Continuing with empty session \
@@ -397,15 +392,14 @@ fn copy_files(sess: &Session, target_dir: &Path, source_dir: &Path) -> Result<bo
     // We acquire a shared lock on the lock file of the directory, so that
     // nobody deletes it out from under us while we are reading from it.
     let lock_file_path = lock_file_path(source_dir);
-    let _lock = if let Ok(lock) = flock::Lock::new(
+
+    // not exclusive
+    let Ok(_lock) = flock::Lock::new(
         &lock_file_path,
         false, // don't wait,
         false, // don't create
         false,
-    ) {
-        // not exclusive
-        lock
-    } else {
+    ) else {
         // Could not acquire the lock, don't try to copy from here
         return Err(());
     };
@@ -648,19 +642,12 @@ fn string_to_timestamp(s: &str) -> Result<SystemTime, ()> {
     Ok(UNIX_EPOCH + duration)
 }
 
-fn crate_path(
-    sess: &Session,
-    crate_name: &str,
-    crate_disambiguator: CrateDisambiguator,
-) -> PathBuf {
+fn crate_path(sess: &Session, crate_name: &str, stable_crate_id: StableCrateId) -> PathBuf {
     let incr_dir = sess.opts.incremental.as_ref().unwrap().clone();
 
-    // The full crate disambiguator is really long. 64 bits of it should be
-    // sufficient.
-    let crate_disambiguator = crate_disambiguator.to_fingerprint().to_smaller_hash();
-    let crate_disambiguator = base_n::encode(crate_disambiguator as u128, INT_ENCODE_BASE);
+    let stable_crate_id = base_n::encode(stable_crate_id.to_u64() as u128, INT_ENCODE_BASE);
 
-    let crate_name = format!("{}-{}", crate_name, crate_disambiguator);
+    let crate_name = format!("{}-{}", crate_name, stable_crate_id);
     incr_dir.join(crate_name)
 }
 

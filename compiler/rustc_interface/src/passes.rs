@@ -4,43 +4,42 @@ use crate::util;
 
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast::{self as ast, visit};
+use rustc_borrowck as mir_borrowck;
 use rustc_codegen_ssa::back::link::emit_metadata;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::parallel;
-use rustc_data_structures::steal::Steal;
-use rustc_data_structures::sync::{par_iter, Lrc, OnceCell, ParallelIterator, WorkerLocal};
+use rustc_data_structures::sync::{Lrc, OnceCell, WorkerLocal};
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_errors::{ErrorReported, PResult};
 use rustc_expand::base::ExtCtxt;
-use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_hir::def_id::{StableCrateId, LOCAL_CRATE};
 use rustc_hir::Crate;
 use rustc_lint::LintStore;
 use rustc_metadata::creader::CStore;
+use rustc_metadata::{encode_metadata, EncodedMetadata};
 use rustc_middle::arena::Arena;
 use rustc_middle::dep_graph::DepGraph;
-use rustc_middle::middle;
-use rustc_middle::middle::cstore::{CrateStore, MetadataLoader, MetadataLoaderDyn};
-use rustc_middle::ty::query::Providers;
+use rustc_middle::ty::query::{ExternProviders, Providers};
 use rustc_middle::ty::{self, GlobalCtxt, ResolverOutputs, TyCtxt};
-use rustc_mir as mir;
 use rustc_mir_build as mir_build;
-use rustc_parse::{parse_crate_from_file, parse_crate_from_source_str};
+use rustc_parse::{parse_crate_from_file, parse_crate_from_source_str, validate_attr};
 use rustc_passes::{self, hir_stats, layout_test};
 use rustc_plugin_impl as plugin;
-use rustc_query_impl::Queries as TcxQueries;
+use rustc_query_impl::{OnDiskCache, Queries as TcxQueries};
 use rustc_resolve::{Resolver, ResolverArenas};
+use rustc_serialize::json;
 use rustc_session::config::{CrateType, Input, OutputFilenames, OutputType, PpMode, PpSourceMode};
+use rustc_session::cstore::{MetadataLoader, MetadataLoaderDyn};
 use rustc_session::lint;
 use rustc_session::output::{filename_for_input, filename_for_metadata};
 use rustc_session::search_paths::PathKind;
-use rustc_session::Session;
-use rustc_span::symbol::{Ident, Symbol};
+use rustc_session::{Limit, Session};
+use rustc_span::symbol::{sym, Ident, Symbol};
+use rustc_span::FileName;
 use rustc_trait_selection::traits;
 use rustc_typeck as typeck;
-use tracing::{info, warn};
-
-use rustc_serialize::json;
 use tempfile::Builder as TempFileBuilder;
+use tracing::{info, warn};
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -48,7 +47,7 @@ use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::lazy::SyncLazy;
 use std::marker::PhantomPinned;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::{env, fs, iter};
@@ -101,7 +100,7 @@ mod boxed_resolver {
     }
 
     // Note: Drop order is important to prevent dangling references. Resolver must be dropped first,
-    // then resolver_arenas and finally session.
+    // then resolver_arenas and session.
     impl Drop for BoxedResolverInner {
         fn drop(&mut self) {
             self.resolver.take();
@@ -110,13 +109,10 @@ mod boxed_resolver {
     }
 
     impl BoxedResolver {
-        pub(super) fn new<F>(session: Lrc<Session>, make_resolver: F) -> Result<(ast::Crate, Self)>
-        where
-            F: for<'a> FnOnce(
-                &'a Session,
-                &'a ResolverArenas<'a>,
-            ) -> Result<(ast::Crate, Resolver<'a>)>,
-        {
+        pub(super) fn new(
+            session: Lrc<Session>,
+            make_resolver: impl for<'a> FnOnce(&'a Session, &'a ResolverArenas<'a>) -> Resolver<'a>,
+        ) -> BoxedResolver {
             let mut boxed_resolver = Box::new(BoxedResolverInner {
                 session,
                 resolver_arenas: Some(Resolver::arenas()),
@@ -127,14 +123,14 @@ mod boxed_resolver {
             // returns a resolver with the same lifetime as the arena. We ensure that the arena
             // outlives the resolver in the drop impl and elsewhere so these transmutes are sound.
             unsafe {
-                let (crate_, resolver) = make_resolver(
+                let resolver = make_resolver(
                     std::mem::transmute::<&Session, &Session>(&boxed_resolver.session),
                     std::mem::transmute::<&ResolverArenas<'_>, &ResolverArenas<'_>>(
                         boxed_resolver.resolver_arenas.as_ref().unwrap(),
                     ),
-                )?;
+                );
                 boxed_resolver.resolver = Some(resolver);
-                Ok((crate_, BoxedResolver(Pin::new_unchecked(boxed_resolver))))
+                BoxedResolver(Pin::new_unchecked(boxed_resolver))
             }
         }
 
@@ -165,35 +161,15 @@ mod boxed_resolver {
     }
 }
 
-/// Runs the "early phases" of the compiler: initial `cfg` processing, loading compiler plugins,
-/// syntax expansion, secondary `cfg` expansion, synthesis of a test
-/// harness if one is to be provided, injection of a dependency on the
-/// standard library and prelude, and name resolution.
-///
-/// Returns [`None`] if we're aborting after handling -W help.
-pub fn configure_and_expand(
+pub fn create_resolver(
     sess: Lrc<Session>,
-    lint_store: Lrc<LintStore>,
     metadata_loader: Box<MetadataLoaderDyn>,
-    krate: ast::Crate,
+    krate: &ast::Crate,
     crate_name: &str,
-) -> Result<(ast::Crate, BoxedResolver)> {
-    tracing::trace!("configure_and_expand");
-    // Currently, we ignore the name resolution data structures for the purposes of dependency
-    // tracking. Instead we will run name resolution and include its output in the hash of each
-    // item, much like we do for macro expansion. In other words, the hash reflects not just
-    // its contents but the results of name resolution on those contents. Hopefully we'll push
-    // this back at some point.
-    let crate_name = crate_name.to_string();
+) -> BoxedResolver {
+    tracing::trace!("create_resolver");
     BoxedResolver::new(sess, move |sess, resolver_arenas| {
-        configure_and_expand_inner(
-            sess,
-            &lint_store,
-            krate,
-            &crate_name,
-            &resolver_arenas,
-            metadata_loader,
-        )
+        Resolver::new(sess, krate, crate_name, metadata_loader, resolver_arenas)
     })
 }
 
@@ -203,7 +179,7 @@ pub fn register_plugins<'a>(
     register_lints: impl Fn(&Session, &mut LintStore),
     mut krate: ast::Crate,
     crate_name: &str,
-) -> Result<(ast::Crate, Lrc<LintStore>)> {
+) -> Result<(ast::Crate, LintStore)> {
     krate = sess.time("attributes_injection", || {
         rustc_builtin_macros::cmdline_attrs::inject(
             krate,
@@ -219,9 +195,13 @@ pub fn register_plugins<'a>(
     let crate_types = util::collect_crate_types(sess, &krate.attrs);
     sess.init_crate_types(crate_types);
 
-    let disambiguator = util::compute_crate_disambiguator(sess);
-    sess.crate_disambiguator.set(disambiguator).expect("not yet initialized");
-    rustc_incremental::prepare_session_directory(sess, &crate_name, disambiguator)?;
+    let stable_crate_id = StableCrateId::new(
+        crate_name,
+        sess.crate_types().contains(&CrateType::Executable),
+        sess.opts.cg.metadata.clone(),
+    );
+    sess.stable_crate_id.set(stable_crate_id).expect("not yet initialized");
+    rustc_incremental::prepare_session_directory(sess, crate_name, stable_crate_id)?;
 
     if sess.opts.incremental.is_some() {
         sess.time("incr_comp_garbage_collect_session_directories", || {
@@ -235,15 +215,11 @@ pub fn register_plugins<'a>(
         });
     }
 
-    sess.time("recursion_limit", || {
-        middle::limits::update_limits(sess, &krate);
-    });
-
     let mut lint_store = rustc_lint::new_lint_store(
         sess.opts.debugging_opts.no_interleave_lints,
         sess.unstable_options(),
     );
-    register_lints(&sess, &mut lint_store);
+    register_lints(sess, &mut lint_store);
 
     let registrars =
         sess.time("plugin_loading", || plugin::load::load_plugins(sess, metadata_loader, &krate));
@@ -254,9 +230,6 @@ pub fn register_plugins<'a>(
         }
     });
 
-    let lint_store = Lrc::new(lint_store);
-    sess.init_lint_store(lint_store.clone());
-
     Ok((krate, lint_store))
 }
 
@@ -264,13 +237,15 @@ fn pre_expansion_lint(
     sess: &Session,
     lint_store: &LintStore,
     krate: &ast::Crate,
+    crate_attrs: &[ast::Attribute],
     crate_name: &str,
 ) {
     sess.prof.generic_activity_with_arg("pre_AST_expansion_lint_checks", crate_name).run(|| {
         rustc_lint::check_ast_crate(
             sess,
             lint_store,
-            &krate,
+            krate,
+            crate_attrs,
             true,
             None,
             rustc_lint::BuiltinCombinedPreExpansionLintPass::new(),
@@ -278,31 +253,27 @@ fn pre_expansion_lint(
     });
 }
 
-fn configure_and_expand_inner<'a>(
-    sess: &'a Session,
+/// Runs the "early phases" of the compiler: initial `cfg` processing, loading compiler plugins,
+/// syntax expansion, secondary `cfg` expansion, synthesis of a test
+/// harness if one is to be provided, injection of a dependency on the
+/// standard library and prelude, and name resolution.
+pub fn configure_and_expand(
+    sess: &Session,
     lint_store: &LintStore,
     mut krate: ast::Crate,
     crate_name: &str,
-    resolver_arenas: &'a ResolverArenas<'a>,
-    metadata_loader: Box<MetadataLoaderDyn>,
-) -> Result<(ast::Crate, Resolver<'a>)> {
-    tracing::trace!("configure_and_expand_inner");
-    pre_expansion_lint(sess, lint_store, &krate, crate_name);
-
-    let mut resolver = Resolver::new(sess, &krate, crate_name, metadata_loader, &resolver_arenas);
-    rustc_builtin_macros::register_builtin_macros(&mut resolver);
+    resolver: &mut Resolver<'_>,
+) -> Result<ast::Crate> {
+    tracing::trace!("configure_and_expand");
+    pre_expansion_lint(sess, lint_store, &krate, &krate.attrs, crate_name);
+    rustc_builtin_macros::register_builtin_macros(resolver);
 
     krate = sess.time("crate_injection", || {
         let alt_std_name = sess.opts.alt_std_name.as_ref().map(|s| Symbol::intern(s));
-        rustc_builtin_macros::standard_library_imports::inject(
-            krate,
-            &mut resolver,
-            &sess,
-            alt_std_name,
-        )
+        rustc_builtin_macros::standard_library_imports::inject(krate, resolver, sess, alt_std_name)
     });
 
-    util::check_attr_crate_type(&sess, &krate.attrs, &mut resolver.lint_buffer());
+    util::check_attr_crate_type(sess, &krate.attrs, &mut resolver.lint_buffer());
 
     // Expand all macros
     krate = sess.time("macro_expand_crate", || {
@@ -339,9 +310,10 @@ fn configure_and_expand_inner<'a>(
 
         // Create the config for macro expansion
         let features = sess.features_untracked();
+        let recursion_limit = get_recursion_limit(&krate.attrs, sess);
         let cfg = rustc_expand::expand::ExpansionConfig {
-            features: Some(&features),
-            recursion_limit: sess.recursion_limit(),
+            features: Some(features),
+            recursion_limit,
             trace_mac: sess.opts.debugging_opts.trace_macros,
             should_test: sess.opts.test,
             span_debug: sess.opts.debugging_opts.span_debug,
@@ -349,12 +321,13 @@ fn configure_and_expand_inner<'a>(
             ..rustc_expand::expand::ExpansionConfig::default(crate_name.to_string())
         };
 
+        let crate_attrs = krate.attrs.clone();
         let extern_mod_loaded = |ident: Ident, attrs, items, span| {
-            let krate = ast::Crate { attrs, items, span, proc_macros: vec![] };
-            pre_expansion_lint(sess, lint_store, &krate, &ident.name.as_str());
+            let krate = ast::Crate { attrs, items, span };
+            pre_expansion_lint(sess, lint_store, &krate, &crate_attrs, &ident.name.as_str());
             (krate.attrs, krate.items)
         };
-        let mut ecx = ExtCtxt::new(&sess, cfg, &mut resolver, Some(&extern_mod_loaded));
+        let mut ecx = ExtCtxt::new(sess, cfg, resolver, Some(&extern_mod_loaded));
 
         // Expand macros now!
         let krate = sess.time("expand_crate", || ecx.monotonic_expander().expand_crate(krate));
@@ -396,16 +369,16 @@ fn configure_and_expand_inner<'a>(
     })?;
 
     sess.time("maybe_building_test_harness", || {
-        rustc_builtin_macros::test_harness::inject(&sess, &mut resolver, &mut krate)
+        rustc_builtin_macros::test_harness::inject(sess, resolver, &mut krate)
     });
 
     if let Some(PpMode::Source(PpSourceMode::EveryBodyLoops)) = sess.opts.pretty {
         tracing::debug!("replacing bodies with loop {{}}");
-        util::ReplaceBodyWithLoop::new(&mut resolver).visit_crate(&mut krate);
+        util::ReplaceBodyWithLoop::new(resolver).visit_crate(&mut krate);
     }
 
     let has_proc_macro_decls = sess.time("AST_validation", || {
-        rustc_ast_passes::ast_validation::check_crate(sess, &krate, &mut resolver.lint_buffer())
+        rustc_ast_passes::ast_validation::check_crate(sess, &krate, resolver.lint_buffer())
     });
 
     let crate_types = sess.crate_types();
@@ -419,8 +392,8 @@ fn configure_and_expand_inner<'a>(
     // start passing '--crate-type proc-macro'
     if has_proc_macro_decls && sess.opts.actually_rustdoc && !is_proc_macro_crate {
         let mut msg = sess.diagnostic().struct_warn(
-            &"Trying to document proc macro crate \
-            without passing '--crate-type proc-macro to rustdoc",
+            "Trying to document proc macro crate \
+             without passing '--crate-type proc-macro to rustdoc",
         );
 
         msg.warn("The generated documentation may be incorrect");
@@ -430,8 +403,8 @@ fn configure_and_expand_inner<'a>(
             let num_crate_types = crate_types.len();
             let is_test_crate = sess.opts.test;
             rustc_builtin_macros::proc_macro_harness::inject(
-                &sess,
-                &mut resolver,
+                sess,
+                resolver,
                 krate,
                 is_proc_macro_crate,
                 has_proc_macro_decls,
@@ -464,52 +437,52 @@ fn configure_and_expand_inner<'a>(
     });
 
     // Add all buffered lints from the `ParseSess` to the `Session`.
-    sess.parse_sess.buffered_lints.with_lock(|buffered_lints| {
-        info!("{} parse sess buffered_lints", buffered_lints.len());
-        for early_lint in buffered_lints.drain(..) {
-            resolver.lint_buffer().add_early_lint(early_lint);
-        }
-    });
+    // The ReplaceBodyWithLoop pass may have deleted some AST nodes, potentially
+    // causing a delay_span_bug later if a buffered lint refers to such a deleted
+    // AST node (issue #87308). Since everybody_loops is for pretty-printing only,
+    // anyway, we simply skip all buffered lints here.
+    if !matches!(sess.opts.pretty, Some(PpMode::Source(PpSourceMode::EveryBodyLoops))) {
+        sess.parse_sess.buffered_lints.with_lock(|buffered_lints| {
+            info!("{} parse sess buffered_lints", buffered_lints.len());
+            for early_lint in buffered_lints.drain(..) {
+                resolver.lint_buffer().add_early_lint(early_lint);
+            }
+        });
+    }
 
-    Ok((krate, resolver))
+    Ok(krate)
 }
 
 pub fn lower_to_hir<'res, 'tcx>(
     sess: &'tcx Session,
     lint_store: &LintStore,
     resolver: &'res mut Resolver<'_>,
-    dep_graph: &'res DepGraph,
-    krate: &'res ast::Crate,
+    krate: Rc<ast::Crate>,
     arena: &'tcx rustc_ast_lowering::Arena<'tcx>,
-) -> Crate<'tcx> {
-    // We're constructing the HIR here; we don't care what we will
-    // read, since we haven't even constructed the *input* to
-    // incr. comp. yet.
-    dep_graph.assert_ignored();
-
+) -> &'tcx Crate<'tcx> {
     // Lower AST to HIR.
     let hir_crate = rustc_ast_lowering::lower_crate(
         sess,
-        &krate,
+        &*krate,
         resolver,
         rustc_parse::nt_to_tokenstream,
         arena,
     );
-
-    if sess.opts.debugging_opts.hir_stats {
-        hir_stats::print_hir_stats(&hir_crate);
-    }
 
     sess.time("early_lint_checks", || {
         rustc_lint::check_ast_crate(
             sess,
             lint_store,
             &krate,
+            &krate.attrs,
             false,
             Some(std::mem::take(resolver.lint_buffer())),
             rustc_lint::BuiltinCombinedEarlyLintPass::new(),
         )
     });
+
+    // Drop AST to free memory
+    sess.time("drop_ast", || std::mem::drop(krate));
 
     // Discard hygiene data, which isn't required after lowering to HIR.
     if !sess.opts.debugging_opts.keep_hygiene_data {
@@ -563,7 +536,7 @@ where
     None
 }
 
-fn output_contains_path(output_paths: &[PathBuf], input_path: &PathBuf) -> bool {
+fn output_contains_path(output_paths: &[PathBuf], input_path: &Path) -> bool {
     let input_path = input_path.canonicalize().ok();
     if input_path.is_none() {
         return false;
@@ -579,9 +552,9 @@ fn output_conflicts_with_dir(output_paths: &[PathBuf]) -> Option<PathBuf> {
     check_output(output_paths, check)
 }
 
-fn escape_dep_filename(filename: &String) -> String {
+fn escape_dep_filename(filename: &str) -> String {
     // Apparently clang and gcc *only* escape spaces:
-    // http://llvm.org/klaus/clang/commit/9d50634cfc268ecc9a7250226dd5ca0e945240d4
+    // https://llvm.org/klaus/clang/commit/9d50634cfc268ecc9a7250226dd5ca0e945240d4
     filename.replace(" ", "\\ ")
 }
 
@@ -603,7 +576,7 @@ fn escape_dep_env(symbol: Symbol) -> String {
 
 fn write_out_deps(
     sess: &Session,
-    boxed_resolver: &Steal<Rc<RefCell<BoxedResolver>>>,
+    boxed_resolver: &RefCell<BoxedResolver>,
     outputs: &OutputFilenames,
     out_filenames: &[PathBuf],
 ) {
@@ -625,12 +598,22 @@ fn write_out_deps(
             .map(|fmap| escape_dep_filename(&fmap.name.prefer_local().to_string()))
             .collect();
 
+        // Account for explicitly marked-to-track files
+        // (e.g. accessed in proc macros).
+        let file_depinfo = sess.parse_sess.file_depinfo.borrow();
+        let extra_tracked_files = file_depinfo.iter().map(|path_sym| {
+            let path = PathBuf::from(&*path_sym.as_str());
+            let file = FileName::from(path);
+            escape_dep_filename(&file.prefer_local().to_string())
+        });
+        files.extend(extra_tracked_files);
+
         if let Some(ref backend) = sess.opts.debugging_opts.codegen_backend {
             files.push(backend.to_string());
         }
 
         if sess.binary_dep_depinfo() {
-            boxed_resolver.borrow().borrow_mut().access(|resolver| {
+            boxed_resolver.borrow_mut().access(|resolver| {
                 for cnum in resolver.cstore().crates_untracked() {
                     let source = resolver.cstore().crate_source_untracked(cnum);
                     if let Some((path, _)) = source.dylib {
@@ -699,7 +682,7 @@ pub fn prepare_outputs(
     sess: &Session,
     compiler: &Compiler,
     krate: &ast::Crate,
-    boxed_resolver: &Steal<Rc<RefCell<BoxedResolver>>>,
+    boxed_resolver: &RefCell<BoxedResolver>,
     crate_name: &str,
 ) -> Result<OutputFilenames> {
     let _timer = sess.timer("prepare_outputs");
@@ -709,12 +692,13 @@ pub fn prepare_outputs(
         &compiler.input,
         &compiler.output_dir,
         &compiler.output_file,
+        &compiler.temps_dir,
         &krate.attrs,
         sess,
     );
 
     let output_paths =
-        generated_output_paths(sess, &outputs, compiler.output_file.is_some(), &crate_name);
+        generated_output_paths(sess, &outputs, compiler.output_file.is_some(), crate_name);
 
     // Ensure the source file isn't accidentally overwritten during compilation.
     if let Some(ref input_path) = compiler.input_path {
@@ -739,6 +723,13 @@ pub fn prepare_outputs(
         }
     }
 
+    if let Some(ref dir) = compiler.temps_dir {
+        if fs::create_dir_all(dir).is_err() {
+            sess.err("failed to find or create the directory specified by `--temps-dir`");
+            return Err(ErrorReported);
+        }
+    }
+
     write_out_deps(sess, boxed_resolver, &outputs, &output_paths);
 
     let only_dep_info = sess.opts.output_types.contains_key(&OutputType::DepInfo)
@@ -760,10 +751,12 @@ pub static DEFAULT_QUERY_PROVIDERS: SyncLazy<Providers> = SyncLazy::new(|| {
     let providers = &mut Providers::default();
     providers.analysis = analysis;
     proc_macro_decls::provide(providers);
-    plugin::build::provide(providers);
+    rustc_const_eval::provide(providers);
     rustc_middle::hir::provide(providers);
-    mir::provide(providers);
+    mir_borrowck::provide(providers);
     mir_build::provide(providers);
+    rustc_mir_transform::provide(providers);
+    rustc_monomorphize::provide(providers);
     rustc_privacy::provide(providers);
     typeck::provide(providers);
     ty::provide(providers);
@@ -779,8 +772,8 @@ pub static DEFAULT_QUERY_PROVIDERS: SyncLazy<Providers> = SyncLazy::new(|| {
     *providers
 });
 
-pub static DEFAULT_EXTERN_QUERY_PROVIDERS: SyncLazy<Providers> = SyncLazy::new(|| {
-    let mut extern_providers = *DEFAULT_QUERY_PROVIDERS;
+pub static DEFAULT_EXTERN_QUERY_PROVIDERS: SyncLazy<ExternProviders> = SyncLazy::new(|| {
+    let mut extern_providers = ExternProviders::default();
     rustc_metadata::provide_extern(&mut extern_providers);
     rustc_codegen_ssa::provide_extern(&mut extern_providers);
     extern_providers
@@ -803,16 +796,26 @@ impl<'tcx> QueryContext<'tcx> {
 pub fn create_global_ctxt<'tcx>(
     compiler: &'tcx Compiler,
     lint_store: Lrc<LintStore>,
-    krate: &'tcx Crate<'tcx>,
+    krate: Rc<ast::Crate>,
     dep_graph: DepGraph,
-    resolver_outputs: ResolverOutputs,
+    resolver: Rc<RefCell<BoxedResolver>>,
     outputs: OutputFilenames,
     crate_name: &str,
     queries: &'tcx OnceCell<TcxQueries<'tcx>>,
     global_ctxt: &'tcx OnceCell<GlobalCtxt<'tcx>>,
     arena: &'tcx WorkerLocal<Arena<'tcx>>,
+    hir_arena: &'tcx WorkerLocal<rustc_ast_lowering::Arena<'tcx>>,
 ) -> QueryContext<'tcx> {
+    // We're constructing the HIR here; we don't care what we will
+    // read, since we haven't even constructed the *input* to
+    // incr. comp. yet.
+    dep_graph.assert_ignored();
+
     let sess = &compiler.session();
+    let krate = resolver
+        .borrow_mut()
+        .access(|resolver| lower_to_hir(sess, &lint_store, resolver, krate, hir_arena));
+    let resolver_outputs = BoxedResolver::to_resolver_outputs(resolver);
 
     let query_result_on_disk_cache = rustc_incremental::load_query_result_cache(sess);
 
@@ -821,17 +824,18 @@ pub fn create_global_ctxt<'tcx>(
     codegen_backend.provide(&mut local_providers);
 
     let mut extern_providers = *DEFAULT_EXTERN_QUERY_PROVIDERS;
-    codegen_backend.provide(&mut extern_providers);
     codegen_backend.provide_extern(&mut extern_providers);
 
     if let Some(callback) = compiler.override_queries {
         callback(sess, &mut local_providers, &mut extern_providers);
     }
 
-    let queries = queries.get_or_init(|| TcxQueries::new(local_providers, extern_providers));
+    let queries = queries.get_or_init(|| {
+        TcxQueries::new(local_providers, extern_providers, query_result_on_disk_cache)
+    });
 
     let gcx = sess.time("setup_global_ctxt", || {
-        global_ctxt.get_or_init(|| {
+        global_ctxt.get_or_init(move || {
             TyCtxt::create_global_ctxt(
                 sess,
                 lint_store,
@@ -839,9 +843,10 @@ pub fn create_global_ctxt<'tcx>(
                 resolver_outputs,
                 krate,
                 dep_graph,
-                query_result_on_disk_cache,
+                queries.on_disk_cache.as_ref().map(OnDiskCache::as_dyn),
                 queries.as_dyn(),
-                &crate_name,
+                rustc_query_impl::query_callbacks(arena),
+                crate_name,
                 outputs,
             )
         })
@@ -863,26 +868,27 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
             {
                 entry_point = sess.time("looking_for_entry_point", || tcx.entry_fn(()));
 
-                sess.time("looking_for_plugin_registrar", || tcx.ensure().plugin_registrar_fn(()));
-
                 sess.time("looking_for_derive_registrar", || {
                     tcx.ensure().proc_macro_decls_static(())
                 });
 
-                let cstore = tcx
-                    .cstore_as_any()
-                    .downcast_ref::<CStore>()
-                    .expect("`tcx.cstore` is not a `CStore`");
-                cstore.report_unused_deps(tcx);
+                CStore::from_tcx(tcx).report_unused_deps(tcx);
             },
             {
-                par_iter(&tcx.hir().krate().modules).for_each(|(&module, _)| {
+                tcx.hir().par_for_each_module(|module| {
                     tcx.ensure().check_mod_loops(module);
                     tcx.ensure().check_mod_attrs(module);
                     tcx.ensure().check_mod_naked_functions(module);
                     tcx.ensure().check_mod_unstable_api_usage(module);
                     tcx.ensure().check_mod_const_bodies(module);
                 });
+            },
+            {
+                // We force these querie to run,
+                // since they might not otherwise get called.
+                // This marks the corresponding crate-level attributes
+                // as used, and ensures that their values are valid.
+                tcx.ensure().limits(());
             }
         );
     });
@@ -894,14 +900,12 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
         parallel!(
             {
                 sess.time("match_checking", || {
-                    tcx.par_body_owners(|def_id| {
-                        tcx.ensure().check_match(def_id.to_def_id());
-                    });
+                    tcx.hir().par_body_owners(|def_id| tcx.ensure().check_match(def_id.to_def_id()))
                 });
             },
             {
                 sess.time("liveness_and_intrinsic_checking", || {
-                    par_iter(&tcx.hir().krate().modules).for_each(|(&module, _)| {
+                    tcx.hir().par_for_each_module(|module| {
                         // this must run before MIR dump, because
                         // "not all control paths return a value" is reported here.
                         //
@@ -915,14 +919,14 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
     });
 
     sess.time("MIR_borrow_checking", || {
-        tcx.par_body_owners(|def_id| tcx.ensure().mir_borrowck(def_id));
+        tcx.hir().par_body_owners(|def_id| tcx.ensure().mir_borrowck(def_id));
     });
 
     sess.time("MIR_effect_checking", || {
-        for def_id in tcx.body_owners() {
+        for def_id in tcx.hir().body_owners() {
             tcx.ensure().thir_check_unsafety(def_id);
             if !tcx.sess.opts.debugging_opts.thir_unsafeck {
-                mir::transform::check_unsafety::check_unsafety(tcx, def_id);
+                rustc_mir_transform::check_unsafety::check_unsafety(tcx, def_id);
             }
 
             if tcx.hir().body_const_context(def_id).is_some() {
@@ -971,7 +975,7 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
             },
             {
                 sess.time("privacy_checking_modules", || {
-                    par_iter(&tcx.hir().krate().modules).for_each(|(&module, _)| {
+                    tcx.hir().par_for_each_module(|module| {
                         tcx.ensure().check_mod_privacy(module);
                     });
                 });
@@ -985,7 +989,7 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
 fn encode_and_write_metadata(
     tcx: TyCtxt<'_>,
     outputs: &OutputFilenames,
-) -> (middle::cstore::EncodedMetadata, bool) {
+) -> (EncodedMetadata, bool) {
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
     enum MetadataKind {
         None,
@@ -1008,8 +1012,8 @@ fn encode_and_write_metadata(
         .unwrap_or(MetadataKind::None);
 
     let metadata = match metadata_kind {
-        MetadataKind::None => middle::cstore::EncodedMetadata::new(),
-        MetadataKind::Uncompressed | MetadataKind::Compressed => tcx.encode_metadata(),
+        MetadataKind::None => EncodedMetadata::new(),
+        MetadataKind::Uncompressed | MetadataKind::Compressed => encode_metadata(tcx),
     };
 
     let _prof_timer = tcx.sess.prof.generic_activity("write_crate_metadata");
@@ -1028,7 +1032,7 @@ fn encode_and_write_metadata(
             .tempdir_in(out_filename.parent().unwrap())
             .unwrap_or_else(|err| tcx.sess.fatal(&format!("couldn't create a temp dir: {}", err)));
         let metadata_tmpdir = MaybeTempDir::new(metadata_tmpdir, tcx.sess.opts.cg.save_temps);
-        let metadata_filename = emit_metadata(tcx.sess, &metadata.raw_data, &metadata_tmpdir);
+        let metadata_filename = emit_metadata(tcx.sess, metadata.raw_data(), &metadata_tmpdir);
         if let Err(e) = util::non_durable_rename(&metadata_filename, &out_filename) {
             tcx.sess.fatal(&format!("failed to write {}: {}", out_filename.display(), e));
         }
@@ -1070,11 +1074,32 @@ pub fn start_codegen<'tcx>(
     info!("Post-codegen\n{:?}", tcx.debug_stats());
 
     if tcx.sess.opts.output_types.contains_key(&OutputType::Mir) {
-        if let Err(e) = mir::transform::dump_mir::emit_mir(tcx, outputs) {
+        if let Err(e) = rustc_mir_transform::dump_mir::emit_mir(tcx, outputs) {
             tcx.sess.err(&format!("could not emit MIR: {}", e));
             tcx.sess.abort_if_errors();
         }
     }
 
     codegen
+}
+
+fn get_recursion_limit(krate_attrs: &[ast::Attribute], sess: &Session) -> Limit {
+    if let Some(attr) = krate_attrs
+        .iter()
+        .find(|attr| attr.has_name(sym::recursion_limit) && attr.value_str().is_none())
+    {
+        // This is here mainly to check for using a macro, such as
+        // #![recursion_limit = foo!()]. That is not supported since that
+        // would require expanding this while in the middle of expansion,
+        // which needs to know the limit before expanding. Otherwise,
+        // validation would normally be caught in AstValidator (via
+        // `check_builtin_attribute`), but by the time that runs the macro
+        // is expanded, and it doesn't give an error.
+        validate_attr::emit_fatal_malformed_builtin_attribute(
+            &sess.parse_sess,
+            attr,
+            sym::recursion_limit,
+        );
+    }
+    rustc_middle::middle::limits::get_recursion_limit(krate_attrs, sess)
 }

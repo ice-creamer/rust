@@ -737,14 +737,14 @@ impl<T: Clone> Bound<&T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(bound_cloned)]
     /// use std::ops::Bound::*;
     /// use std::ops::RangeBounds;
     ///
     /// assert_eq!((1..12).start_bound(), Included(&1));
     /// assert_eq!((1..12).start_bound().cloned(), Included(1));
     /// ```
-    #[unstable(feature = "bound_cloned", issue = "61356")]
+    #[must_use = "`self` will be dropped if the result is not used"]
+    #[stable(feature = "bound_cloned", since = "1.55.0")]
     pub fn cloned(self) -> Bound<T> {
         match self {
             Bound::Unbounded => Bound::Unbounded,
@@ -813,12 +813,12 @@ pub trait RangeBounds<T: ?Sized> {
         U: ?Sized + PartialOrd<T>,
     {
         (match self.start_bound() {
-            Included(ref start) => *start <= item,
-            Excluded(ref start) => *start < item,
+            Included(start) => start <= item,
+            Excluded(start) => start < item,
             Unbounded => true,
         }) && (match self.end_bound() {
-            Included(ref end) => item <= *end,
-            Excluded(ref end) => item < *end,
+            Included(end) => item <= end,
+            Excluded(end) => item < end,
             Unbounded => true,
         })
     }

@@ -26,8 +26,7 @@ impl<'a> Parser<'a> {
     /// Parses a source module as a crate. This is the main entry point for the parser.
     pub fn parse_crate_mod(&mut self) -> PResult<'a, ast::Crate> {
         let (attrs, items, span) = self.parse_mod(&token::Eof)?;
-        let proc_macros = Vec::new(); // Filled in by `proc_macro_harness::inject()`.
-        Ok(ast::Crate { attrs, items, span, proc_macros })
+        Ok(ast::Crate { attrs, items, span })
     }
 
     /// Parses a `mod <foo> { ... }` or `mod <foo>;` item.
@@ -217,11 +216,11 @@ impl<'a> Parser<'a> {
                 return Err(e);
             }
 
-            (Ident::invalid(), ItemKind::Use(tree))
+            (Ident::empty(), ItemKind::Use(tree))
         } else if self.check_fn_front_matter(def_final) {
             // FUNCTION ITEM
             let (ident, sig, generics, body) = self.parse_fn(attrs, req_name, lo)?;
-            (ident, ItemKind::Fn(box FnKind(def(), sig, generics, body)))
+            (ident, ItemKind::Fn(Box::new(Fn { defaultness: def(), sig, generics, body })))
         } else if self.eat_keyword(kw::Extern) {
             if self.eat_keyword(kw::Crate) {
                 // EXTERN CRATE
@@ -280,15 +279,15 @@ impl<'a> Parser<'a> {
         } else if self.eat_keyword(kw::Macro) {
             // MACROS 2.0 ITEM
             self.parse_item_decl_macro(lo)?
-        } else if self.is_macro_rules_item() {
+        } else if let IsMacroRulesItem::Yes { has_bang } = self.is_macro_rules_item() {
             // MACRO_RULES ITEM
-            self.parse_item_macro_rules(vis)?
+            self.parse_item_macro_rules(vis, has_bang)?
         } else if vis.kind.is_pub() && self.isnt_macro_invocation() {
             self.recover_missing_kw_before_item()?;
             return Ok(None);
         } else if macros_allowed && self.check_path() {
             // MACRO INVOCATION ITEM
-            (Ident::invalid(), ItemKind::MacCall(self.parse_item_macro(vis)?))
+            (Ident::empty(), ItemKind::MacCall(self.parse_item_macro(vis)?))
         } else {
             return Ok(None);
         };
@@ -301,7 +300,7 @@ impl<'a> Parser<'a> {
         || self.is_kw_followed_by_ident(kw::Union) // no: `union::b`, yes: `union U { .. }`
         || self.check_auto_or_unsafe_trait_item() // no: `auto::b`, yes: `auto trait X { .. }`
         || self.is_async_fn() // no(2015): `async::b`, yes: `async fn`
-        || self.is_macro_rules_item() // no: `macro_rules::b`, yes: `macro_rules! mac`
+        || matches!(self.is_macro_rules_item(), IsMacroRulesItem::Yes{..}) // no: `macro_rules::b`, yes: `macro_rules! mac`
     }
 
     /// Are we sure this could not possibly be a macro invocation?
@@ -494,7 +493,20 @@ impl<'a> Parser<'a> {
         let ty_first = if self.token.is_keyword(kw::For) && self.look_ahead(1, |t| t != &token::Lt)
         {
             let span = self.prev_token.span.between(self.token.span);
-            self.struct_span_err(span, "missing trait in a trait impl").emit();
+            self.struct_span_err(span, "missing trait in a trait impl")
+                .span_suggestion(
+                    span,
+                    "add a trait here",
+                    " Trait ".into(),
+                    Applicability::HasPlaceholders,
+                )
+                .span_suggestion(
+                    span.to(self.token.span),
+                    "for an inherent impl, drop this `for`",
+                    "".into(),
+                    Applicability::MaybeIncorrect,
+                )
+                .emit();
             P(Ty {
                 kind: TyKind::Path(None, err_path(span)),
                 span,
@@ -548,7 +560,7 @@ impl<'a> Parser<'a> {
                 };
                 let trait_ref = TraitRef { path, ref_id: ty_first.id };
 
-                ItemKind::Impl(box ImplKind {
+                ItemKind::Impl(Box::new(Impl {
                     unsafety,
                     polarity,
                     defaultness,
@@ -557,11 +569,11 @@ impl<'a> Parser<'a> {
                     of_trait: Some(trait_ref),
                     self_ty: ty_second,
                     items: impl_items,
-                })
+                }))
             }
             None => {
                 // impl Type
-                ItemKind::Impl(box ImplKind {
+                ItemKind::Impl(Box::new(Impl {
                     unsafety,
                     polarity,
                     defaultness,
@@ -570,11 +582,11 @@ impl<'a> Parser<'a> {
                     of_trait: None,
                     self_ty: ty_first,
                     items: impl_items,
-                })
+                }))
             }
         };
 
-        Ok((Ident::invalid(), item_kind))
+        Ok((Ident::empty(), item_kind))
     }
 
     fn parse_item_list<T>(
@@ -670,7 +682,7 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword(kw::Trait)?;
         let ident = self.parse_ident()?;
-        let mut tps = self.parse_generics()?;
+        let mut generics = self.parse_generics()?;
 
         // Parse optional colon and supertrait bounds.
         let had_colon = self.eat(&token::Colon);
@@ -690,7 +702,7 @@ impl<'a> Parser<'a> {
             }
 
             let bounds = self.parse_generic_bounds(None)?;
-            tps.where_clause = self.parse_where_clause()?;
+            generics.where_clause = self.parse_where_clause()?;
             self.expect_semi()?;
 
             let whole_span = lo.to(self.prev_token.span);
@@ -705,12 +717,15 @@ impl<'a> Parser<'a> {
 
             self.sess.gated_spans.gate(sym::trait_alias, whole_span);
 
-            Ok((ident, ItemKind::TraitAlias(tps, bounds)))
+            Ok((ident, ItemKind::TraitAlias(generics, bounds)))
         } else {
             // It's a normal trait.
-            tps.where_clause = self.parse_where_clause()?;
+            generics.where_clause = self.parse_where_clause()?;
             let items = self.parse_item_list(attrs, |p| p.parse_trait_item(ForceCollect::No))?;
-            Ok((ident, ItemKind::Trait(box TraitKind(is_auto, unsafety, tps, bounds, items))))
+            Ok((
+                ident,
+                ItemKind::Trait(Box::new(Trait { is_auto, unsafety, generics, bounds, items })),
+            ))
         }
     }
 
@@ -757,7 +772,7 @@ impl<'a> Parser<'a> {
     /// TypeAlias = "type" Ident Generics {":" GenericBounds}? {"=" Ty}? ";" ;
     /// ```
     /// The `"type"` has already been eaten.
-    fn parse_type_alias(&mut self, def: Defaultness) -> PResult<'a, ItemInfo> {
+    fn parse_type_alias(&mut self, defaultness: Defaultness) -> PResult<'a, ItemInfo> {
         let ident = self.parse_ident()?;
         let mut generics = self.parse_generics()?;
 
@@ -766,10 +781,10 @@ impl<'a> Parser<'a> {
             if self.eat(&token::Colon) { self.parse_generic_bounds(None)? } else { Vec::new() };
         generics.where_clause = self.parse_where_clause()?;
 
-        let default = if self.eat(&token::Eq) { Some(self.parse_ty()?) } else { None };
+        let ty = if self.eat(&token::Eq) { Some(self.parse_ty()?) } else { None };
         self.expect_semi()?;
 
-        Ok((ident, ItemKind::TyAlias(box TyAliasKind(def, generics, bounds, default))))
+        Ok((ident, ItemKind::TyAlias(Box::new(TyAlias { defaultness, generics, bounds, ty }))))
     }
 
     /// Parses a `UseTree`.
@@ -921,7 +936,7 @@ impl<'a> Parser<'a> {
         let abi = self.parse_abi(); // ABI?
         let items = self.parse_item_list(attrs, |p| p.parse_foreign_item(ForceCollect::No))?;
         let module = ast::ForeignMod { unsafety, abi, items };
-        Ok((Ident::invalid(), ItemKind::ForeignMod(module)))
+        Ok((Ident::empty(), ItemKind::ForeignMod(module)))
     }
 
     /// Parses a foreign item (one in an `extern { ... }` block).
@@ -1027,9 +1042,7 @@ impl<'a> Parser<'a> {
         };
 
         match impl_info.1 {
-            ItemKind::Impl(box ImplKind {
-                of_trait: Some(ref trai), ref mut constness, ..
-            }) => {
+            ItemKind::Impl(box Impl { of_trait: Some(ref trai), ref mut constness, .. }) => {
                 *constness = Const::Yes(const_span);
 
                 let before_trait = trai.path.span.shrink_to_lo();
@@ -1107,8 +1120,7 @@ impl<'a> Parser<'a> {
                 e
             })?;
 
-        let enum_definition =
-            EnumDef { variants: variants.into_iter().filter_map(|v| v).collect() };
+        let enum_definition = EnumDef { variants: variants.into_iter().flatten().collect() };
         Ok((id, ItemKind::Enum(enum_definition, generics)))
     }
 
@@ -1143,7 +1155,7 @@ impl<'a> Parser<'a> {
                     ident,
                     vis,
                     id: DUMMY_NODE_ID,
-                    attrs: variant_attrs,
+                    attrs: variant_attrs.into(),
                     data: struct_def,
                     disr_expr,
                     span: vlo.to(this.prev_token.span),
@@ -1236,7 +1248,7 @@ impl<'a> Parser<'a> {
         Ok((class_name, ItemKind::Union(vdata, generics)))
     }
 
-    pub(super) fn parse_record_struct_body(
+    fn parse_record_struct_body(
         &mut self,
         adt_ty: &str,
     ) -> PResult<'a, (Vec<FieldDef>, /* recovered */ bool)> {
@@ -1286,7 +1298,7 @@ impl<'a> Parser<'a> {
                         ident: None,
                         id: DUMMY_NODE_ID,
                         ty,
-                        attrs,
+                        attrs: attrs.into(),
                         is_placeholder: false,
                     },
                     TrailingToken::MaybeComma,
@@ -1460,7 +1472,7 @@ impl<'a> Parser<'a> {
             vis,
             id: DUMMY_NODE_ID,
             ty,
-            attrs,
+            attrs: attrs.into(),
             is_placeholder: false,
         })
     }
@@ -1470,28 +1482,22 @@ impl<'a> Parser<'a> {
     fn parse_field_ident(&mut self, adt_ty: &str, lo: Span) -> PResult<'a, Ident> {
         let (ident, is_raw) = self.ident_or_err()?;
         if !is_raw && ident.is_reserved() {
-            if ident.name == kw::Underscore {
-                self.sess.gated_spans.gate(sym::unnamed_fields, lo);
+            let err = if self.check_fn_front_matter(false) {
+                // We use `parse_fn` to get a span for the function
+                if let Err(mut db) = self.parse_fn(&mut Vec::new(), |_| true, lo) {
+                    db.delay_as_bug();
+                }
+                let mut err = self.struct_span_err(
+                    lo.to(self.prev_token.span),
+                    &format!("functions are not allowed in {} definitions", adt_ty),
+                );
+                err.help("unlike in C++, Java, and C#, functions are declared in `impl` blocks");
+                err.help("see https://doc.rust-lang.org/book/ch05-03-method-syntax.html for more information");
+                err
             } else {
-                let err = if self.check_fn_front_matter(false) {
-                    // We use `parse_fn` to get a span for the function
-                    if let Err(mut db) = self.parse_fn(&mut Vec::new(), |_| true, lo) {
-                        db.delay_as_bug();
-                    }
-                    let mut err = self.struct_span_err(
-                        lo.to(self.prev_token.span),
-                        &format!("functions are not allowed in {} definitions", adt_ty),
-                    );
-                    err.help(
-                        "unlike in C++, Java, and C#, functions are declared in `impl` blocks",
-                    );
-                    err.help("see https://doc.rust-lang.org/book/ch05-03-method-syntax.html for more information");
-                    err
-                } else {
-                    self.expected_ident_found()
-                };
-                return Err(err);
-            }
+                self.expected_ident_found()
+            };
+            return Err(err);
         }
         self.bump();
         Ok(ident)
@@ -1529,19 +1535,58 @@ impl<'a> Parser<'a> {
         Ok((ident, ItemKind::MacroDef(ast::MacroDef { body, macro_rules: false })))
     }
 
-    /// Is this unambiguously the start of a `macro_rules! foo` item definition?
-    fn is_macro_rules_item(&mut self) -> bool {
-        self.check_keyword(kw::MacroRules)
-            && self.look_ahead(1, |t| *t == token::Not)
-            && self.look_ahead(2, |t| t.is_ident())
+    /// Is this a possibly malformed start of a `macro_rules! foo` item definition?
+
+    fn is_macro_rules_item(&mut self) -> IsMacroRulesItem {
+        if self.check_keyword(kw::MacroRules) {
+            let macro_rules_span = self.token.span;
+
+            if self.look_ahead(1, |t| *t == token::Not) && self.look_ahead(2, |t| t.is_ident()) {
+                return IsMacroRulesItem::Yes { has_bang: true };
+            } else if self.look_ahead(1, |t| (t.is_ident())) {
+                // macro_rules foo
+                self.struct_span_err(macro_rules_span, "expected `!` after `macro_rules`")
+                    .span_suggestion(
+                        macro_rules_span,
+                        "add a `!`",
+                        "macro_rules!".to_owned(),
+                        Applicability::MachineApplicable,
+                    )
+                    .emit();
+
+                return IsMacroRulesItem::Yes { has_bang: false };
+            }
+        }
+
+        IsMacroRulesItem::No
     }
 
     /// Parses a `macro_rules! foo { ... }` declarative macro.
-    fn parse_item_macro_rules(&mut self, vis: &Visibility) -> PResult<'a, ItemInfo> {
+    fn parse_item_macro_rules(
+        &mut self,
+        vis: &Visibility,
+        has_bang: bool,
+    ) -> PResult<'a, ItemInfo> {
         self.expect_keyword(kw::MacroRules)?; // `macro_rules`
-        self.expect(&token::Not)?; // `!`
 
+        if has_bang {
+            self.expect(&token::Not)?; // `!`
+        }
         let ident = self.parse_ident()?;
+
+        if self.eat(&token::Not) {
+            // Handle macro_rules! foo!
+            let span = self.prev_token.span;
+            self.struct_span_err(span, "macro names aren't followed by a `!`")
+                .span_suggestion(
+                    span,
+                    "remove the `!`",
+                    "".to_owned(),
+                    Applicability::MachineApplicable,
+                )
+                .emit();
+        }
+
         let body = self.parse_mac_args()?;
         self.eat_semi_for_macro_if_needed(&body);
         self.complain_if_pub_macro(vis, true);
@@ -1715,13 +1760,11 @@ impl<'a> Parser<'a> {
                     // the AST for typechecking.
                     err.span_label(ident.span, "while parsing this `fn`");
                     err.emit();
-                    (Vec::new(), None)
                 } else {
                     return Err(err);
                 }
-            } else {
-                unreachable!()
             }
+            (Vec::new(), None)
         };
         attrs.extend(inner_attrs);
         Ok(body)
@@ -1771,8 +1814,14 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_fn_front_matter(&mut self) -> PResult<'a, FnHeader> {
         let sp_start = self.token.span;
         let constness = self.parse_constness();
+
+        let async_start_sp = self.token.span;
         let asyncness = self.parse_asyncness();
+
+        let unsafe_start_sp = self.token.span;
         let unsafety = self.parse_unsafety();
+
+        let ext_start_sp = self.token.span;
         let ext = self.parse_extern();
 
         if let Async::Yes { span, .. } = asyncness {
@@ -1787,11 +1836,44 @@ impl<'a> Parser<'a> {
                 Ok(true) => {}
                 Ok(false) => unreachable!(),
                 Err(mut err) => {
+                    // Qualifier keywords ordering check
+
+                    // This will allow the machine fix to directly place the keyword in the correct place
+                    let current_qual_sp = if self.check_keyword(kw::Const) {
+                        Some(async_start_sp)
+                    } else if self.check_keyword(kw::Async) {
+                        Some(unsafe_start_sp)
+                    } else if self.check_keyword(kw::Unsafe) {
+                        Some(ext_start_sp)
+                    } else {
+                        None
+                    };
+
+                    if let Some(current_qual_sp) = current_qual_sp {
+                        let current_qual_sp = current_qual_sp.to(self.prev_token.span);
+                        if let Ok(current_qual) = self.span_to_snippet(current_qual_sp) {
+                            let invalid_qual_sp = self.token.uninterpolated_span();
+                            let invalid_qual = self.span_to_snippet(invalid_qual_sp).unwrap();
+
+                            err.span_suggestion(
+                                current_qual_sp.to(invalid_qual_sp),
+                                &format!("`{}` must come before `{}`", invalid_qual, current_qual),
+                                format!("{} {}", invalid_qual, current_qual),
+                                Applicability::MachineApplicable,
+                            ).note("keyword order for functions declaration is `default`, `pub`, `const`, `async`, `unsafe`, `extern`");
+                        }
+                    }
                     // Recover incorrect visibility order such as `async pub`.
-                    if self.check_keyword(kw::Pub) {
+                    else if self.check_keyword(kw::Pub) {
                         let sp = sp_start.to(self.prev_token.span);
                         if let Ok(snippet) = self.span_to_snippet(sp) {
-                            let vis = self.parse_visibility(FollowedByType::No)?;
+                            let vis = match self.parse_visibility(FollowedByType::No) {
+                                Ok(v) => v,
+                                Err(mut d) => {
+                                    d.cancel();
+                                    return Err(err);
+                                }
+                            };
                             let vs = pprust::vis_to_string(&vis);
                             let vs = vs.trim_end();
                             err.span_suggestion(
@@ -2064,4 +2146,9 @@ impl<'a> Parser<'a> {
             _ => "function",
         }
     }
+}
+
+enum IsMacroRulesItem {
+    Yes { has_bang: bool },
+    No,
 }

@@ -4,12 +4,15 @@ use std::path::Path;
 
 use rustc_span::edition::Edition;
 use rustc_span::source_map::DUMMY_SP;
+use rustc_span::Symbol;
 
 use crate::config::{Options, RenderOptions};
 use crate::doctest::{Collector, TestOptions};
 use crate::html::escape::Escape;
 use crate::html::markdown;
-use crate::html::markdown::{find_testable_code, ErrorCodes, IdMap, Markdown, MarkdownWithToc};
+use crate::html::markdown::{
+    find_testable_code, ErrorCodes, HeadingOffset, IdMap, Markdown, MarkdownWithToc,
+};
 
 /// Separate any lines at the start of the file that begin with `# ` or `%`.
 fn extract_leading_metadata(s: &str) -> (Vec<&str>, &str) {
@@ -69,7 +72,16 @@ crate fn render<P: AsRef<Path>>(
     let text = if !options.markdown_no_toc {
         MarkdownWithToc(text, &mut ids, error_codes, edition, &playground).into_string()
     } else {
-        Markdown(text, &[], &mut ids, error_codes, edition, &playground).into_string()
+        Markdown {
+            content: text,
+            links: &[],
+            ids: &mut ids,
+            error_codes,
+            edition,
+            playground: &playground,
+            heading_offset: HeadingOffset::H1,
+        }
+        .into_string()
     };
 
     let err = write!(
@@ -114,14 +126,14 @@ crate fn render<P: AsRef<Path>>(
 }
 
 /// Runs any tests/code examples in the markdown file `input`.
-crate fn test(mut options: Options) -> Result<(), String> {
+crate fn test(options: Options) -> Result<(), String> {
     let input_str = read_to_string(&options.input)
         .map_err(|err| format!("{}: {}", options.input.display(), err))?;
     let mut opts = TestOptions::default();
     opts.no_crate_inject = true;
-    opts.display_warnings = options.display_warnings;
+    opts.display_doctest_warnings = options.display_doctest_warnings;
     let mut collector = Collector::new(
-        options.input.display().to_string(),
+        Symbol::intern(&options.input.display().to_string()),
         options.clone(),
         true,
         opts,
@@ -134,11 +146,11 @@ crate fn test(mut options: Options) -> Result<(), String> {
 
     find_testable_code(&input_str, &mut collector, codes, options.enable_per_target_ignores, None);
 
-    options.test_args.insert(0, "rustdoctest".to_string());
-    testing::test_main(
-        &options.test_args,
+    crate::doctest::run_tests(
+        options.test_args,
+        options.nocapture,
+        options.display_doctest_warnings,
         collector.tests,
-        Some(testing::Options::new().display_output(options.display_warnings)),
     );
     Ok(())
 }

@@ -56,19 +56,21 @@ This API is completely unstable and subject to change.
 */
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bindings_after_at)]
 #![feature(bool_to_option)]
-#![feature(box_syntax)]
 #![feature(crate_visibility_modifier)]
-#![feature(format_args_capture)]
+#![cfg_attr(bootstrap, feature(format_args_capture))]
+#![feature(if_let_guard)]
 #![feature(in_band_lifetimes)]
 #![feature(is_sorted)]
 #![feature(iter_zip)]
+#![feature(let_else)]
+#![feature(min_specialization)]
 #![feature(nll)]
 #![feature(try_blocks)]
 #![feature(never_type)]
 #![feature(slice_partition_dedup)]
 #![feature(control_flow_enum)]
+#![feature(hash_drain_filter)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -88,6 +90,7 @@ mod coherence;
 mod collect;
 mod constrained_generic_params;
 mod errors;
+pub mod hir_wf_check;
 mod impl_wf_check;
 mod mem_categorization;
 mod outlives;
@@ -107,6 +110,7 @@ use rustc_middle::util;
 use rustc_session::config::EntryFnType;
 use rustc_span::{symbol::sym, Span, DUMMY_SP};
 use rustc_target::spec::abi::Abi;
+use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::error_reporting::InferCtxtExt as _;
 use rustc_trait_selection::traits::{
     self, ObligationCause, ObligationCauseCode, TraitEngine, TraitEngineExt as _,
@@ -143,7 +147,7 @@ fn require_same_types<'tcx>(
     tcx.infer_ctxt().enter(|ref infcx| {
         let param_env = ty::ParamEnv::empty();
         let mut fulfill_cx = <dyn TraitEngine<'_>>::new(infcx.tcx);
-        match infcx.at(&cause, param_env).eq(expected, actual) {
+        match infcx.at(cause, param_env).eq(expected, actual) {
             Ok(InferOk { obligations, .. }) => {
                 fulfill_cx.register_predicate_obligations(infcx, obligations);
             }
@@ -153,10 +157,10 @@ fn require_same_types<'tcx>(
             }
         }
 
-        match fulfill_cx.select_all_or_error(infcx) {
-            Ok(()) => true,
-            Err(errors) => {
-                infcx.report_fulfillment_errors(&errors, None, false);
+        match fulfill_cx.select_all_or_error(infcx).as_slice() {
+            [] => true,
+            errors => {
+                infcx.report_fulfillment_errors(errors, None, false);
                 false
             }
         }
@@ -187,9 +191,11 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
         let hir_id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
         match tcx.hir().find(hir_id) {
             Some(Node::Item(hir::Item { kind: hir::ItemKind::Fn(_, ref generics, _), .. })) => {
-                let generics_param_span =
-                    if !generics.params.is_empty() { Some(generics.span) } else { None };
-                generics_param_span
+                if !generics.params.is_empty() {
+                    Some(generics.span)
+                } else {
+                    None
+                }
             }
             _ => {
                 span_bug!(tcx.def_span(def_id), "main has a non-function type");
@@ -291,7 +297,7 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
     }
 
     for attr in tcx.get_attrs(main_def_id) {
-        if tcx.sess.check_name(attr, sym::track_caller) {
+        if attr.has_name(sym::track_caller) {
             tcx.sess
                 .struct_span_err(
                     attr.span,
@@ -326,9 +332,29 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
                 ObligationCauseCode::MainFunctionType,
             );
             let mut fulfillment_cx = traits::FulfillmentContext::new();
-            fulfillment_cx.register_bound(&infcx, ty::ParamEnv::empty(), return_ty, term_id, cause);
-            if let Err(err) = fulfillment_cx.select_all_or_error(&infcx) {
-                infcx.report_fulfillment_errors(&err, None, false);
+            // normalize any potential projections in the return type, then add
+            // any possible obligations to the fulfillment context.
+            // HACK(ThePuzzlemaker) this feels symptomatic of a problem within
+            // checking trait fulfillment, not this here. I'm not sure why it
+            // works in the example in `fn test()` given in #88609? This also
+            // probably isn't the best way to do this.
+            let InferOk { value: norm_return_ty, obligations } = infcx
+                .partially_normalize_associated_types_in(
+                    cause.clone(),
+                    ty::ParamEnv::empty(),
+                    return_ty,
+                );
+            fulfillment_cx.register_predicate_obligations(&infcx, obligations);
+            fulfillment_cx.register_bound(
+                &infcx,
+                ty::ParamEnv::empty(),
+                norm_return_ty,
+                term_id,
+                cause,
+            );
+            let errors = fulfillment_cx.select_all_or_error(&infcx);
+            if !errors.is_empty() {
+                infcx.report_fulfillment_errors(&errors, None, false);
                 error = true;
             }
         });
@@ -405,7 +431,7 @@ fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: DefId) {
 
                     let attrs = tcx.hir().attrs(start_id);
                     for attr in attrs {
-                        if tcx.sess.check_name(attr, sym::track_caller) {
+                        if attr.has_name(sym::track_caller) {
                             tcx.sess
                                 .struct_span_err(
                                     attr.span,
@@ -462,6 +488,7 @@ pub fn provide(providers: &mut Providers) {
     variance::provide(providers);
     outlives::provide(providers);
     impl_wf_check::provide(providers);
+    hir_wf_check::provide(providers);
 }
 
 pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
@@ -472,9 +499,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
     // FIXME(matthewjasper) We shouldn't need to use `track_errors`.
     tcx.sess.track_errors(|| {
         tcx.sess.time("type_collecting", || {
-            for &module in tcx.hir().krate().modules.keys() {
-                tcx.ensure().collect_mod_item_types(module);
-            }
+            tcx.hir().for_each_module(|module| tcx.ensure().collect_mod_item_types(module))
         });
     })?;
 
@@ -504,9 +529,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
 
     // NOTE: This is copy/pasted in librustdoc/core.rs and should be kept in sync.
     tcx.sess.time("item_types_checking", || {
-        for &module in tcx.hir().krate().modules.keys() {
-            tcx.ensure().check_mod_item_types(module);
-        }
+        tcx.hir().for_each_module(|module| tcx.ensure().check_mod_item_types(module))
     });
 
     tcx.sess.time("item_bodies_checking", || tcx.typeck_item_bodies(()));
@@ -545,7 +568,7 @@ pub fn hir_trait_to_predicates<'tcx>(
         &item_cx,
         hir_trait,
         DUMMY_SP,
-        hir::Constness::NotConst,
+        ty::BoundConstness::NotConst,
         self_ty,
         &mut bounds,
         true,

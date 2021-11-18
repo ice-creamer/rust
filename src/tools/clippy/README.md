@@ -10,16 +10,17 @@ A collection of lints to catch common mistakes and improve your [Rust](https://g
 Lints are divided into categories, each with a default [lint level](https://doc.rust-lang.org/rustc/lints/levels.html).
 You can choose how much Clippy is supposed to ~~annoy~~ help you by changing the lint level by category.
 
-| Category              | Description                                                             | Default level |
-| --------------------- | ----------------------------------------------------------------------- | ------------- |
-| `clippy::all`         | all lints that are on by default (correctness, style, complexity, perf) | **warn/deny** |
-| `clippy::correctness` | code that is outright wrong or very useless                             | **deny**      |
-| `clippy::style`       | code that should be written in a more idiomatic way                     | **warn**      |
-| `clippy::complexity`  | code that does something simple but in a complex way                    | **warn**      |
-| `clippy::perf`        | code that can be written to run faster                                  | **warn**      |
-| `clippy::pedantic`    | lints which are rather strict or might have false positives             | allow         |
-| `clippy::nursery`     | new lints that are still under development                              | allow         |
-| `clippy::cargo`       | lints for the cargo manifest                                            | allow         |
+| Category              | Description                                                                         | Default level |
+| --------------------- | ----------------------------------------------------------------------------------- | ------------- |
+| `clippy::all`         | all lints that are on by default (correctness, suspicious, style, complexity, perf) | **warn/deny** |
+| `clippy::correctness` | code that is outright wrong or useless                                              | **deny**      |
+| `clippy::suspicious`  | code that is most likely wrong or useless                                           | **warn**      |
+| `clippy::style`       | code that should be written in a more idiomatic way                                 | **warn**      |
+| `clippy::complexity`  | code that does something simple but in a complex way                                | **warn**      |
+| `clippy::perf`        | code that can be written to run faster                                              | **warn**      |
+| `clippy::pedantic`    | lints which are rather strict or have occasional false positives                    | allow         |
+| `clippy::nursery`     | new lints that are still under development                                          | allow         |
+| `clippy::cargo`       | lints for the cargo manifest                                                        | allow         |
 
 More to come, please [file an issue](https://github.com/rust-lang/rust-clippy/issues) if you have ideas!
 
@@ -44,13 +45,13 @@ or in Travis CI.
 One way to use Clippy is by installing Clippy through rustup as a cargo
 subcommand.
 
-#### Step 1: Install rustup
+#### Step 1: Install Rustup
 
-You can install [rustup](https://rustup.rs/) on supported platforms. This will help
+You can install [Rustup](https://rustup.rs/) on supported platforms. This will help
 us install Clippy and its dependencies.
 
-If you already have rustup installed, update to ensure you have the latest
-rustup and compiler:
+If you already have Rustup installed, update to ensure you have the latest
+Rustup and compiler:
 
 ```terminal
 rustup update
@@ -75,11 +76,10 @@ cargo clippy
 
 #### Automatically applying Clippy suggestions
 
-Clippy can automatically apply some lint suggestions.
-Note that this is still experimental and only supported on the nightly channel:
+Clippy can automatically apply some lint suggestions, just like the compiler.
 
 ```terminal
-cargo clippy --fix -Z unstable-options
+cargo clippy --fix
 ```
 
 #### Workspaces
@@ -95,7 +95,7 @@ As with `cargo check`, this includes dependencies that are members of the worksp
 If you want to run Clippy **only** on the given crate, use the `--no-deps` option like this:
 
 ```terminal
-cargo clippy -p example -- --no-deps 
+cargo clippy -p example -- --no-deps
 ```
 
 ### As a rustc replacement (`clippy-driver`)

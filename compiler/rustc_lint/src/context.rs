@@ -16,8 +16,9 @@
 
 use self::TargetLint::*;
 
-use crate::levels::LintLevelsBuilder;
+use crate::levels::{is_known_lint_tool, LintLevelsBuilder};
 use crate::passes::{EarlyLintPassObject, LateLintPassObject};
+use ast::util::unicode::TEXT_FLOW_CONTROL_CHARS;
 use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync;
@@ -31,17 +32,16 @@ use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
 use rustc_middle::lint::LintDiagnosticBuilder;
 use rustc_middle::middle::privacy::AccessLevels;
 use rustc_middle::middle::stability;
-use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
+use rustc_middle::ty::layout::{LayoutError, LayoutOfHelpers, TyAndLayout};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, print::Printer, subst::GenericArg, Ty, TyCtxt};
 use rustc_serialize::json::Json;
 use rustc_session::lint::{BuiltinLintDiagnostics, ExternDepSpec};
 use rustc_session::lint::{FutureIncompatibleInfo, Level, Lint, LintBuffer, LintId};
 use rustc_session::Session;
-use rustc_session::SessionLintStore;
 use rustc_span::lev_distance::find_best_match_for_name;
-use rustc_span::{symbol::Symbol, MultiSpan, Span, DUMMY_SP};
-use rustc_target::abi::LayoutOf;
+use rustc_span::{symbol::Symbol, BytePos, MultiSpan, Span, DUMMY_SP};
+use rustc_target::abi;
 use tracing::debug;
 
 use std::cell::Cell;
@@ -73,20 +73,6 @@ pub struct LintStore {
 
     /// Map of registered lint groups to what lints they expand to.
     lint_groups: FxHashMap<&'static str, LintGroup>,
-}
-
-impl SessionLintStore for LintStore {
-    fn name_to_lint(&self, lint_name: &str) -> LintId {
-        let lints = self
-            .find_lints(lint_name)
-            .unwrap_or_else(|_| panic!("Failed to find lint with name `{}`", lint_name));
-
-        if let &[lint] = lints.as_slice() {
-            return lint;
-        } else {
-            panic!("Found mutliple lints with name `{}`: {:?}", lint_name, lints);
-        }
-    }
 }
 
 /// The target of the `by_name` map, which accounts for renaming/deprecation.
@@ -129,6 +115,8 @@ pub enum CheckLintNameResult<'a> {
     Ok(&'a [LintId]),
     /// Lint doesn't exist. Potentially contains a suggestion for a correct lint name.
     NoLint(Option<Symbol>),
+    /// The lint refers to a tool that has not been registered.
+    NoTool,
     /// The lint is either renamed or removed. This is the warning
     /// message, and an optional new name (`None` if removed).
     Warning(String, Option<String>),
@@ -209,8 +197,8 @@ impl LintStore {
                 bug!("duplicate specification of lint {}", lint.name_lower())
             }
 
-            if let Some(FutureIncompatibleInfo { edition, .. }) = lint.future_incompatible {
-                if let Some(edition) = edition {
+            if let Some(FutureIncompatibleInfo { reason, .. }) = lint.future_incompatible {
+                if let Some(edition) = reason.edition() {
                     self.lint_groups
                         .entry(edition.lint_name())
                         .or_insert(LintGroup {
@@ -220,17 +208,20 @@ impl LintStore {
                         })
                         .lint_ids
                         .push(id);
+                } else {
+                    // Lints belonging to the `future_incompatible` lint group are lints where a
+                    // future version of rustc will cause existing code to stop compiling.
+                    // Lints tied to an edition don't count because they are opt-in.
+                    self.lint_groups
+                        .entry("future_incompatible")
+                        .or_insert(LintGroup {
+                            lint_ids: vec![],
+                            from_plugin: lint.is_plugin,
+                            depr: None,
+                        })
+                        .lint_ids
+                        .push(id);
                 }
-
-                self.lint_groups
-                    .entry("future_incompatible")
-                    .or_insert(LintGroup {
-                        lint_ids: vec![],
-                        from_plugin: lint.is_plugin,
-                        depr: None,
-                    })
-                    .lint_ids
-                    .push(id);
             }
         }
     }
@@ -270,22 +261,6 @@ impl LintStore {
 
         if !new {
             bug!("duplicate specification of lint group {}", name);
-        }
-    }
-
-    /// This lint should be available with either the old or the new name.
-    ///
-    /// Using the old name will not give a warning.
-    /// You must register a lint with the new name before calling this function.
-    #[track_caller]
-    pub fn register_alias(&mut self, old_name: &str, new_name: &str) {
-        let target = match self.by_name.get(new_name) {
-            Some(&Id(lint_id)) => lint_id,
-            _ => bug!("cannot add alias {} for lint {} that does not exist", old_name, new_name),
-        };
-        match self.by_name.insert(old_name.to_string(), Id(target)) {
-            None | Some(Ignored) => {}
-            Some(x) => bug!("duplicate specification of lint {} (was {:?})", old_name, x),
         }
     }
 
@@ -334,15 +309,26 @@ impl LintStore {
         }
     }
 
-    /// Checks the validity of lint names derived from the command line. Returns
-    /// true if the lint is valid, false otherwise.
+    /// Checks the validity of lint names derived from the command line.
     pub fn check_lint_name_cmdline(
         &self,
         sess: &Session,
         lint_name: &str,
-        level: Option<Level>,
-    ) -> bool {
-        let db = match self.check_lint_name(lint_name, None) {
+        level: Level,
+        crate_attrs: &[ast::Attribute],
+    ) {
+        let (tool_name, lint_name_only) = parse_lint_and_tool_name(lint_name);
+        if lint_name_only == crate::WARNINGS.name_lower() && level == Level::ForceWarn {
+            return struct_span_err!(
+                sess,
+                DUMMY_SP,
+                E0602,
+                "`{}` lint group is not supported with ´--force-warn´",
+                crate::WARNINGS.name_lower()
+            )
+            .emit();
+        }
+        let db = match self.check_lint_name(sess, lint_name_only, tool_name, crate_attrs) {
             CheckLintNameResult::Ok(_) => None,
             CheckLintNameResult::Warning(ref msg, _) => Some(sess.struct_warn(msg)),
             CheckLintNameResult::NoLint(suggestion) => {
@@ -364,26 +350,29 @@ impl LintStore {
                 ))),
                 _ => None,
             },
+            CheckLintNameResult::NoTool => Some(struct_span_err!(
+                sess,
+                DUMMY_SP,
+                E0602,
+                "unknown lint tool: `{}`",
+                tool_name.unwrap()
+            )),
         };
 
         if let Some(mut db) = db {
-            if let Some(level) = level {
-                let msg = format!(
-                    "requested on the command line with `{} {}`",
-                    match level {
-                        Level::Allow => "-A",
-                        Level::Warn => "-W",
-                        Level::Deny => "-D",
-                        Level::Forbid => "-F",
-                    },
-                    lint_name
-                );
-                db.note(&msg);
-            }
+            let msg = format!(
+                "requested on the command line with `{} {}`",
+                match level {
+                    Level::Allow => "-A",
+                    Level::Warn => "-W",
+                    Level::ForceWarn => "--force-warn",
+                    Level::Deny => "-D",
+                    Level::Forbid => "-F",
+                },
+                lint_name
+            );
+            db.note(&msg);
             db.emit();
-            false
-        } else {
-            true
         }
     }
 
@@ -410,9 +399,17 @@ impl LintStore {
     /// printing duplicate warnings.
     pub fn check_lint_name(
         &self,
+        sess: &Session,
         lint_name: &str,
         tool_name: Option<Symbol>,
+        crate_attrs: &[ast::Attribute],
     ) -> CheckLintNameResult<'_> {
+        if let Some(tool_name) = tool_name {
+            if !is_known_lint_tool(tool_name, sess, crate_attrs) {
+                return CheckLintNameResult::NoTool;
+            }
+        }
+
         let complete_name = if let Some(tool_name) = tool_name {
             format!("{}::{}", tool_name, lint_name)
         } else {
@@ -479,17 +476,17 @@ impl LintStore {
 
     fn no_lint_suggestion(&self, lint_name: &str) -> CheckLintNameResult<'_> {
         let name_lower = lint_name.to_lowercase();
-        let symbols =
-            self.get_lints().iter().map(|l| Symbol::intern(&l.name_lower())).collect::<Vec<_>>();
 
         if lint_name.chars().any(char::is_uppercase) && self.find_lints(&name_lower).is_ok() {
             // First check if the lint name is (partly) in upper case instead of lower case...
-            CheckLintNameResult::NoLint(Some(Symbol::intern(&name_lower)))
-        } else {
-            // ...if not, search for lints with a similar name
-            let suggestion = find_best_match_for_name(&symbols, Symbol::intern(&name_lower), None);
-            CheckLintNameResult::NoLint(suggestion)
+            return CheckLintNameResult::NoLint(Some(Symbol::intern(&name_lower)));
         }
+        // ...if not, search for lints with a similar name
+        let groups = self.lint_groups.keys().copied().map(Symbol::intern);
+        let lints = self.lints.iter().map(|l| Symbol::intern(&l.name_lower()));
+        let names: Vec<Symbol> = groups.chain(lints).collect();
+        let suggestion = find_best_match_for_name(&names, Symbol::intern(&name_lower), None);
+        CheckLintNameResult::NoLint(suggestion)
     }
 
     fn check_tool_name_for_backwards_compat(
@@ -601,6 +598,42 @@ pub trait LintContext: Sized {
             // Now, set up surrounding context.
             let sess = self.sess();
             match diagnostic {
+                BuiltinLintDiagnostics::UnicodeTextFlow(span, content) => {
+                    let spans: Vec<_> = content
+                        .char_indices()
+                        .filter_map(|(i, c)| {
+                            TEXT_FLOW_CONTROL_CHARS.contains(&c).then(|| {
+                                let lo = span.lo() + BytePos(2 + i as u32);
+                                (c, span.with_lo(lo).with_hi(lo + BytePos(c.len_utf8() as u32)))
+                            })
+                        })
+                        .collect();
+                    let (an, s) = match spans.len() {
+                        1 => ("an ", ""),
+                        _ => ("", "s"),
+                    };
+                    db.span_label(span, &format!(
+                        "this comment contains {}invisible unicode text flow control codepoint{}",
+                        an,
+                        s,
+                    ));
+                    for (c, span) in &spans {
+                        db.span_label(*span, format!("{:?}", c));
+                    }
+                    db.note(
+                        "these kind of unicode codepoints change the way text flows on \
+                         applications that support them, but can cause confusion because they \
+                         change the order of characters on the screen",
+                    );
+                    if !spans.is_empty() {
+                        db.multipart_suggestion_with_style(
+                            "if their presence wasn't intentional, you can remove them",
+                            spans.into_iter().map(|(_, span)| (span, "".to_string())).collect(),
+                            Applicability::MachineApplicable,
+                            SuggestionStyle::HideCodeAlways,
+                        );
+                    }
+                },
                 BuiltinLintDiagnostics::Normal => (),
                 BuiltinLintDiagnostics::BareTraitObject(span, is_global) => {
                     let (sugg, app) = match sess.source_map().span_to_snippet(span) {
@@ -723,6 +756,43 @@ pub trait LintContext: Sized {
                 BuiltinLintDiagnostics::OrPatternsBackCompat(span,suggestion) => {
                     db.span_suggestion(span, "use pat_param to preserve semantics", suggestion, Applicability::MachineApplicable);
                 }
+                BuiltinLintDiagnostics::ReservedPrefix(span) => {
+                    db.span_label(span, "unknown prefix");
+                    db.span_suggestion_verbose(
+                        span.shrink_to_hi(),
+                        "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
+                        " ".into(),
+                        Applicability::MachineApplicable,
+                    );
+                }
+                BuiltinLintDiagnostics::UnusedBuiltinAttribute {
+                    attr_name,
+                    macro_name,
+                    invoc_span
+                } => {
+                    db.span_note(
+                        invoc_span,
+                        &format!("the built-in attribute `{attr_name}` will be ignored, since it's applied to the macro invocation `{macro_name}`")
+                    );
+                }
+                BuiltinLintDiagnostics::TrailingMacro(is_trailing, name) => {
+                    if is_trailing {
+                        db.note("macro invocations at the end of a block are treated as expressions");
+                        db.note(&format!("to ignore the value produced by the macro, add a semicolon after the invocation of `{name}`"));
+                    }
+                }
+                BuiltinLintDiagnostics::BreakWithLabelAndLoop(span) => {
+                    db.multipart_suggestion(
+                        "wrap this expression in parentheses",
+                        vec![(span.shrink_to_lo(), "(".to_string()),
+                             (span.shrink_to_hi(), ")".to_string())],
+                        Applicability::MachineApplicable
+                    );
+                }
+                BuiltinLintDiagnostics::NamedAsmLabel(help) => {
+                    db.help(&help);
+                    db.note("see the asm section of the unstable book <https://doc.rust-lang.org/nightly/unstable-book/library-features/asm.html#labels> for more information");
+                }
             }
             // Rewrap `db`, and pass control to the user.
             decorate(LintDiagnosticBuilder::new(db));
@@ -757,6 +827,7 @@ impl<'a> EarlyContext<'a> {
         sess: &'a Session,
         lint_store: &'a LintStore,
         krate: &'a ast::Crate,
+        crate_attrs: &'a [ast::Attribute],
         buffered: LintBuffer,
         warn_about_weird_lints: bool,
     ) -> EarlyContext<'a> {
@@ -764,7 +835,7 @@ impl<'a> EarlyContext<'a> {
             sess,
             krate,
             lint_store,
-            builder: LintLevelsBuilder::new(sess, warn_about_weird_lints, lint_store, &krate.attrs),
+            builder: LintLevelsBuilder::new(sess, warn_about_weird_lints, lint_store, crate_attrs),
             buffered,
         }
     }
@@ -1011,11 +1082,43 @@ impl<'tcx> LateContext<'tcx> {
     }
 }
 
-impl<'tcx> LayoutOf for LateContext<'tcx> {
-    type Ty = Ty<'tcx>;
-    type TyAndLayout = Result<TyAndLayout<'tcx>, LayoutError<'tcx>>;
+impl<'tcx> abi::HasDataLayout for LateContext<'tcx> {
+    #[inline]
+    fn data_layout(&self) -> &abi::TargetDataLayout {
+        &self.tcx.data_layout
+    }
+}
 
-    fn layout_of(&self, ty: Ty<'tcx>) -> Self::TyAndLayout {
-        self.tcx.layout_of(self.param_env.and(ty))
+impl<'tcx> ty::layout::HasTyCtxt<'tcx> for LateContext<'tcx> {
+    #[inline]
+    fn tcx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+}
+
+impl<'tcx> ty::layout::HasParamEnv<'tcx> for LateContext<'tcx> {
+    #[inline]
+    fn param_env(&self) -> ty::ParamEnv<'tcx> {
+        self.param_env
+    }
+}
+
+impl<'tcx> LayoutOfHelpers<'tcx> for LateContext<'tcx> {
+    type LayoutOfResult = Result<TyAndLayout<'tcx>, LayoutError<'tcx>>;
+
+    #[inline]
+    fn handle_layout_err(&self, err: LayoutError<'tcx>, _: Span, _: Ty<'tcx>) -> LayoutError<'tcx> {
+        err
+    }
+}
+
+pub fn parse_lint_and_tool_name(lint_name: &str) -> (Option<Symbol>, &str) {
+    match lint_name.split_once("::") {
+        Some((tool_name, lint_name)) => {
+            let tool_name = Symbol::intern(tool_name);
+
+            (Some(tool_name), lint_name)
+        }
+        None => (None, lint_name),
     }
 }

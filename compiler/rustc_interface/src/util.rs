@@ -2,23 +2,23 @@ use rustc_ast::mut_visit::{visit_clobber, MutVisitor, *};
 use rustc_ast::ptr::P;
 use rustc_ast::{self as ast, AttrVec, BlockCheckMode};
 use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 #[cfg(parallel_compiler)]
 use rustc_data_structures::jobserver;
-use rustc_data_structures::stable_hasher::StableHasher;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::registry::Registry;
 use rustc_metadata::dynamic_lib::DynamicLibrary;
 #[cfg(parallel_compiler)]
 use rustc_middle::ty::tls;
+use rustc_parse::validate_attr;
+#[cfg(parallel_compiler)]
+use rustc_query_impl::QueryCtxt;
 use rustc_resolve::{self, Resolver};
 use rustc_session as session;
 use rustc_session::config::{self, CrateType};
 use rustc_session::config::{ErrorOutputType, Input, OutputFilenames};
 use rustc_session::lint::{self, BuiltinLintDiagnostics, LintBuffer};
 use rustc_session::parse::CrateConfig;
-use rustc_session::CrateDisambiguator;
 use rustc_session::{early_error, filesearch, output, DiagnosticOutput, Session};
 use rustc_span::edition::Edition;
 use rustc_span::lev_distance::find_best_match_for_name;
@@ -116,24 +116,11 @@ fn get_stack_size() -> Option<usize> {
 /// for `'static` bounds.
 #[cfg(not(parallel_compiler))]
 pub fn scoped_thread<F: FnOnce() -> R + Send, R: Send>(cfg: thread::Builder, f: F) -> R {
-    struct Ptr(*mut ());
-    unsafe impl Send for Ptr {}
-    unsafe impl Sync for Ptr {}
-
-    let mut f = Some(f);
-    let run = Ptr(&mut f as *mut _ as *mut ());
-    let mut result = None;
-    let result_ptr = Ptr(&mut result as *mut _ as *mut ());
-
-    let thread = cfg.spawn(move || {
-        let run = unsafe { (*(run.0 as *mut Option<F>)).take().unwrap() };
-        let result = unsafe { &mut *(result_ptr.0 as *mut Option<R>) };
-        *result = Some(run());
-    });
-
-    match thread.unwrap().join() {
-        Ok(()) => result.unwrap(),
-        Err(p) => panic::resume_unwind(p),
+    // SAFETY: join() is called immediately, so any closure captures are still
+    // alive.
+    match unsafe { cfg.spawn_unchecked(f) }.unwrap().join() {
+        Ok(v) => v,
+        Err(e) => panic::resume_unwind(e),
     }
 }
 
@@ -153,7 +140,7 @@ pub fn setup_callbacks_and_run_in_thread_pool_with_globals<F: FnOnce() -> R + Se
     crate::callbacks::setup_callbacks();
 
     let main_handler = move || {
-        rustc_span::with_session_globals(edition, || {
+        rustc_span::create_session_globals_then(edition, || {
             io::set_output_capture(stderr.clone());
             f()
         })
@@ -174,12 +161,13 @@ unsafe fn handle_deadlock() {
     rustc_data_structures::sync::assert_sync::<tls::ImplicitCtxt<'_, '_>>();
     let icx: &tls::ImplicitCtxt<'_, '_> = &*(context as *const tls::ImplicitCtxt<'_, '_>);
 
-    let session_globals = rustc_span::SESSION_GLOBALS.with(|sg| sg as *const _);
+    let session_globals = rustc_span::with_session_globals(|sg| sg as *const _);
     let session_globals = &*session_globals;
     thread::spawn(move || {
         tls::enter_context(icx, |_| {
-            rustc_span::SESSION_GLOBALS
-                .set(session_globals, || tls::with(|tcx| tcx.queries.deadlock(tcx, &registry)))
+            rustc_span::set_session_globals_then(session_globals, || {
+                tls::with(|tcx| QueryCtxt::from_tcx(tcx).deadlock(&registry))
+            })
         });
     });
 }
@@ -206,13 +194,13 @@ pub fn setup_callbacks_and_run_in_thread_pool_with_globals<F: FnOnce() -> R + Se
 
     let with_pool = move |pool: &rayon::ThreadPool| pool.install(f);
 
-    rustc_span::with_session_globals(edition, || {
-        rustc_span::SESSION_GLOBALS.with(|session_globals| {
+    rustc_span::create_session_globals_then(edition, || {
+        rustc_span::with_session_globals(|session_globals| {
             // The main handler runs for each Rayon worker thread and sets up
             // the thread local rustc uses. `session_globals` is captured and set
             // on the new threads.
             let main_handler = move |thread: rayon::ThreadBuilder| {
-                rustc_span::SESSION_GLOBALS.set(session_globals, || {
+                rustc_span::set_session_globals_then(session_globals, || {
                     io::set_output_capture(stderr.clone());
                     thread.run()
                 })
@@ -414,7 +402,7 @@ pub fn get_codegen_sysroot(
         .iter()
         .chain(sysroot_candidates.iter())
         .map(|sysroot| {
-            filesearch::make_target_lib_path(&sysroot, &target).with_file_name("codegen-backends")
+            filesearch::make_target_lib_path(sysroot, target).with_file_name("codegen-backends")
         })
         .find(|f| {
             info!("codegen backend candidate: {}", f.display());
@@ -487,39 +475,6 @@ pub fn get_codegen_sysroot(
     }
 }
 
-pub(crate) fn compute_crate_disambiguator(session: &Session) -> CrateDisambiguator {
-    use std::hash::Hasher;
-
-    // The crate_disambiguator is a 128 bit hash. The disambiguator is fed
-    // into various other hashes quite a bit (symbol hashes, incr. comp. hashes,
-    // debuginfo type IDs, etc), so we don't want it to be too wide. 128 bits
-    // should still be safe enough to avoid collisions in practice.
-    let mut hasher = StableHasher::new();
-
-    let mut metadata = session.opts.cg.metadata.clone();
-    // We don't want the crate_disambiguator to dependent on the order
-    // -C metadata arguments, so sort them:
-    metadata.sort();
-    // Every distinct -C metadata value is only incorporated once:
-    metadata.dedup();
-
-    hasher.write(b"metadata");
-    for s in &metadata {
-        // Also incorporate the length of a metadata string, so that we generate
-        // different values for `-Cmetadata=ab -Cmetadata=c` and
-        // `-Cmetadata=a -Cmetadata=bc`
-        hasher.write_usize(s.len());
-        hasher.write(s.as_bytes());
-    }
-
-    // Also incorporate crate type, so that we don't get symbol conflicts when
-    // linking against a library of the same name, if this is an executable.
-    let is_exe = session.crate_types().contains(&CrateType::Executable);
-    hasher.write(if is_exe { b"exe" } else { b"lib" });
-
-    CrateDisambiguator::from(hasher.finish::<Fingerprint>())
-}
-
 pub(crate) fn check_attr_crate_type(
     sess: &Session,
     attrs: &[ast::Attribute],
@@ -527,7 +482,7 @@ pub(crate) fn check_attr_crate_type(
 ) {
     // Unconditionally collect crate types from attributes to make them used
     for a in attrs.iter() {
-        if sess.check_name(a, sym::crate_type) {
+        if a.has_name(sym::crate_type) {
             if let Some(n) = a.value_str() {
                 if categorize_crate_type(n).is_some() {
                     return;
@@ -561,6 +516,19 @@ pub(crate) fn check_attr_crate_type(
                         );
                     }
                 }
+            } else {
+                // This is here mainly to check for using a macro, such as
+                // #![crate_type = foo!()]. That is not supported since the
+                // crate type needs to be known very early in compilation long
+                // before expansion. Otherwise, validation would normally be
+                // caught in AstValidator (via `check_builtin_attribute`), but
+                // by the time that runs the macro is expanded, and it doesn't
+                // give an error.
+                validate_attr::emit_fatal_malformed_builtin_attribute(
+                    &sess.parse_sess,
+                    a,
+                    sym::crate_type,
+                );
             }
         }
     }
@@ -585,7 +553,7 @@ pub fn collect_crate_types(session: &Session, attrs: &[ast::Attribute]) -> Vec<C
     let attr_types: Vec<CrateType> = attrs
         .iter()
         .filter_map(|a| {
-            if session.check_name(a, sym::crate_type) {
+            if a.has_name(sym::crate_type) {
                 match a.value_str() {
                     Some(s) => categorize_crate_type(s),
                     _ => None,
@@ -636,6 +604,7 @@ pub fn build_output_filenames(
     input: &Input,
     odir: &Option<PathBuf>,
     ofile: &Option<PathBuf>,
+    temps_dir: &Option<PathBuf>,
     attrs: &[ast::Attribute],
     sess: &Session,
 ) -> OutputFilenames {
@@ -651,13 +620,14 @@ pub fn build_output_filenames(
                 .opts
                 .crate_name
                 .clone()
-                .or_else(|| rustc_attr::find_crate_name(&sess, attrs).map(|n| n.to_string()))
+                .or_else(|| rustc_attr::find_crate_name(sess, attrs).map(|n| n.to_string()))
                 .unwrap_or_else(|| input.filestem().to_owned());
 
             OutputFilenames::new(
                 dirpath,
                 stem,
                 None,
+                temps_dir.clone(),
                 sess.opts.cg.extra_filename.clone(),
                 sess.opts.output_types.clone(),
             )
@@ -686,6 +656,7 @@ pub fn build_output_filenames(
                 out_file.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
                 out_file.file_stem().unwrap_or_default().to_str().unwrap().to_string(),
                 ofile,
+                temps_dir.clone(),
                 sess.opts.cg.extra_filename.clone(),
                 sess.opts.output_types.clone(),
             )
@@ -808,7 +779,7 @@ impl<'a> MutVisitor for ReplaceBodyWithLoop<'a, '_> {
     fn visit_item_kind(&mut self, i: &mut ast::ItemKind) {
         let is_const = match i {
             ast::ItemKind::Static(..) | ast::ItemKind::Const(..) => true,
-            ast::ItemKind::Fn(box ast::FnKind(_, ref sig, _, _)) => Self::is_sig_const(sig),
+            ast::ItemKind::Fn(box ast::Fn { ref sig, .. }) => Self::is_sig_const(sig),
             _ => false,
         };
         self.run(is_const, |s| noop_visit_item_kind(i, s))
@@ -817,7 +788,7 @@ impl<'a> MutVisitor for ReplaceBodyWithLoop<'a, '_> {
     fn flat_map_trait_item(&mut self, i: P<ast::AssocItem>) -> SmallVec<[P<ast::AssocItem>; 1]> {
         let is_const = match i.kind {
             ast::AssocItemKind::Const(..) => true,
-            ast::AssocItemKind::Fn(box ast::FnKind(_, ref sig, _, _)) => Self::is_sig_const(sig),
+            ast::AssocItemKind::Fn(box ast::Fn { ref sig, .. }) => Self::is_sig_const(sig),
             _ => false,
         };
         self.run(is_const, |s| noop_flat_map_assoc_item(i, s))
@@ -843,6 +814,7 @@ impl<'a> MutVisitor for ReplaceBodyWithLoop<'a, '_> {
                 id: resolver.next_node_id(),
                 span: rustc_span::DUMMY_SP,
                 tokens: None,
+                could_be_bare_literal: false,
             }
         }
 

@@ -14,10 +14,12 @@ use rustc_span::source_map::Spanned;
 use rustc_span::sym;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for using `x.get(x.len() - 1)` instead of
+    /// ### What it does
+    /// Checks for using `x.get(x.len() - 1)` instead of
     /// `x.last()`.
     ///
-    /// **Why is this bad?** Using `x.last()` is easier to read and has the same
+    /// ### Why is this bad?
+    /// Using `x.last()` is easier to read and has the same
     /// result.
     ///
     /// Note that using `x[x.len() - 1]` is semantically different from
@@ -27,10 +29,7 @@ declare_clippy_lint! {
     /// There is another lint (get_unwrap) that covers the case of using
     /// `x.get(index).unwrap()` instead of `x[index]`.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// ```rust
     /// // Bad
     /// let x = vec![2, 3, 5];
@@ -59,7 +58,7 @@ impl<'tcx> LateLintPass<'tcx> for GetLastWithLen {
             // Argument 0 (the struct we're calling the method on) is a vector
             if let Some(struct_calling_on) = args.get(0);
             let struct_ty = cx.typeck_results().expr_ty(struct_calling_on);
-            if is_type_diagnostic_item(cx, struct_ty, sym::vec_type);
+            if is_type_diagnostic_item(cx, struct_ty, sym::Vec);
 
             // Argument to "get" is a subtraction
             if let Some(get_index_arg) = args.get(1);
@@ -74,7 +73,7 @@ impl<'tcx> LateLintPass<'tcx> for GetLastWithLen {
 
             // LHS of subtraction is "x.len()"
             if let ExprKind::MethodCall(arg_lhs_path, _, lhs_args, _) = &lhs.kind;
-            if arg_lhs_path.ident.name == sym!(len);
+            if arg_lhs_path.ident.name == sym::len;
             if let Some(arg_lhs_struct) = lhs_args.get(0);
 
             // The two vectors referenced (x in x.get(...) and in x.len())

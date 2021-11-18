@@ -8,17 +8,14 @@ use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::{source_map::Spanned, symbol::sym, Span};
 
 declare_clippy_lint! {
-    /// **What it does:**
+    /// ### What it does
     /// Checks for calls to `ends_with` with possible file extensions
     /// and suggests to use a case-insensitive approach instead.
     ///
-    /// **Why is this bad?**
+    /// ### Why is this bad?
     /// `ends_with` is case-sensitive and may not detect files with a valid extension.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// ```rust
     /// fn is_rust_file(filename: &str) -> bool {
     ///     filename.ends_with(".rs")
@@ -58,7 +55,7 @@ fn check_case_sensitive_file_extension_comparison(ctx: &LateContext<'_>, expr: &
                     return Some(span);
                 },
                 ty::Adt(&ty::AdtDef { did, .. }, _) => {
-                    if ctx.tcx.is_diagnostic_item(sym::string_type, did) {
+                    if ctx.tcx.is_diagnostic_item(sym::String, did) {
                         return Some(span);
                     }
                 },

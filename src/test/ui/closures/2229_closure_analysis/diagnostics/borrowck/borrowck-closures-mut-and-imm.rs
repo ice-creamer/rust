@@ -1,9 +1,9 @@
+// edition:2021
+
+
+
 // Tests that two closures cannot simultaneously have mutable
 // and immutable access to the variable. Issue #6801.
-
-#![feature(capture_disjoint_fields)]
-//~^ WARNING: the feature `capture_disjoint_fields` is incomplete
-#![feature(box_syntax)]
 
 #[derive(Debug)]
 struct Point {

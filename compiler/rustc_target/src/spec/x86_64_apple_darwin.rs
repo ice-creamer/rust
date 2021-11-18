@@ -1,10 +1,11 @@
-use crate::spec::{LinkerFlavor, SanitizerSet, StackProbeType, Target, TargetOptions};
+use crate::spec::TargetOptions;
+use crate::spec::{FramePointer, LinkerFlavor, SanitizerSet, StackProbeType, Target};
 
 pub fn target() -> Target {
     let mut base = super::apple_base::opts("macos");
     base.cpu = "core2".to_string();
     base.max_atomic_width = Some(128); // core2 support cmpxchg16b
-    base.eliminate_frame_pointer = false;
+    base.frame_pointer = FramePointer::Always;
     base.pre_link_args.insert(
         LinkerFlavor::Gcc,
         vec!["-m64".to_string(), "-arch".to_string(), "x86_64".to_string()],
@@ -12,7 +13,8 @@ pub fn target() -> Target {
     base.link_env_remove.extend(super::apple_base::macos_link_env_remove());
     // don't use probe-stack=inline-asm until rust#83139 and rust#84667 are resolved
     base.stack_probes = StackProbeType::Call;
-    base.supported_sanitizers = SanitizerSet::ADDRESS | SanitizerSet::LEAK | SanitizerSet::THREAD;
+    base.supported_sanitizers =
+        SanitizerSet::ADDRESS | SanitizerSet::CFI | SanitizerSet::LEAK | SanitizerSet::THREAD;
 
     // Clang automatically chooses a more specific target based on
     // MACOSX_DEPLOYMENT_TARGET.  To enable cross-language LTO to work

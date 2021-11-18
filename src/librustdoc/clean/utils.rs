@@ -1,12 +1,15 @@
 use crate::clean::auto_trait::AutoTraitFinder;
 use crate::clean::blanket_impl::BlanketImplFinder;
 use crate::clean::{
-    inline, Clean, Crate, Generic, GenericArg, GenericArgs, ImportSource, Item, ItemKind, Lifetime,
-    Path, PathSegment, Primitive, PrimitiveType, ResolvedPath, Type, TypeBinding,
+    inline, Clean, Crate, ExternalCrate, Generic, GenericArg, GenericArgs, ImportSource, Item,
+    ItemKind, Lifetime, Path, PathSegment, Primitive, PrimitiveType, ResolvedPath, Type,
+    TypeBinding, Visibility,
 };
 use crate::core::DocContext;
 use crate::formats::item_type::ItemType;
 
+use rustc_ast as ast;
+use rustc_ast::tokenstream::TokenTree;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
@@ -14,6 +17,7 @@ use rustc_middle::mir::interpret::ConstValue;
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::{self, DefIdTree, TyCtxt};
 use rustc_span::symbol::{kw, sym, Symbol};
+use std::fmt::Write as _;
 use std::mem;
 
 #[cfg(test)]
@@ -22,20 +26,14 @@ mod tests;
 crate fn krate(cx: &mut DocContext<'_>) -> Crate {
     use crate::visit_lib::LibEmbargoVisitor;
 
-    let krate = cx.tcx.hir().krate();
-    let module = crate::visit_ast::RustdocVisitor::new(cx).visit(krate);
-
-    cx.cache.deref_trait_did = cx.tcx.lang_items().deref_trait();
-    cx.cache.deref_mut_trait_did = cx.tcx.lang_items().deref_mut_trait();
-    cx.cache.owned_box_did = cx.tcx.lang_items().owned_box();
+    let module = crate::visit_ast::RustdocVisitor::new(cx).visit();
 
     let mut externs = Vec::new();
-    for &cnum in cx.tcx.crates().iter() {
-        externs.push((cnum, cnum.clean(cx)));
+    for &cnum in cx.tcx.crates(()) {
+        externs.push(ExternalCrate { crate_num: cnum });
         // Analyze doc-reachability for extern items
         LibEmbargoVisitor::new(cx).visit_lib(cnum);
     }
-    externs.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
 
     // Clean the crate, translating the entire librustc_ast AST to one that is
     // understood by rustdoc.
@@ -57,9 +55,7 @@ crate fn krate(cx: &mut DocContext<'_>) -> Crate {
         _ => unreachable!(),
     }
 
-    let local_crate = LOCAL_CRATE.clean(cx);
-    let src = local_crate.src(cx.tcx);
-    let name = local_crate.name(cx.tcx);
+    let local_crate = ExternalCrate { crate_num: LOCAL_CRATE };
     let primitives = local_crate.primitives(cx.tcx);
     let keywords = local_crate.keywords(cx.tcx);
     {
@@ -81,8 +77,6 @@ crate fn krate(cx: &mut DocContext<'_>) -> Crate {
     }
 
     Crate {
-        name,
-        src,
         module,
         externs,
         primitives,
@@ -93,7 +87,7 @@ crate fn krate(cx: &mut DocContext<'_>) -> Crate {
 
 fn external_generic_args(
     cx: &mut DocContext<'_>,
-    trait_did: Option<DefId>,
+    did: DefId,
     has_self: bool,
     bindings: Vec<TypeBinding>,
     substs: SubstsRef<'_>,
@@ -117,75 +111,47 @@ fn external_generic_args(
                 ty_kind = Some(ty.kind());
                 Some(GenericArg::Type(ty.clean(cx)))
             }
-            GenericArgKind::Const(ct) => Some(GenericArg::Const(ct.clean(cx))),
+            GenericArgKind::Const(ct) => Some(GenericArg::Const(Box::new(ct.clean(cx)))),
         })
         .collect();
 
-    match trait_did {
-        // Attempt to sugar an external path like Fn<(A, B,), C> to Fn(A, B) -> C
-        Some(did) if cx.tcx.fn_trait_kind_from_lang_item(did).is_some() => {
-            assert!(ty_kind.is_some());
-            let inputs = match ty_kind {
-                Some(ty::Tuple(ref tys)) => tys.iter().map(|t| t.expect_ty().clean(cx)).collect(),
-                _ => return GenericArgs::AngleBracketed { args, bindings },
-            };
-            let output = None;
-            // FIXME(#20299) return type comes from a projection now
-            // match types[1].kind {
-            //     ty::Tuple(ref v) if v.is_empty() => None, // -> ()
-            //     _ => Some(types[1].clean(cx))
-            // };
-            GenericArgs::Parenthesized { inputs, output }
-        }
-        _ => GenericArgs::AngleBracketed { args, bindings },
+    if cx.tcx.fn_trait_kind_from_lang_item(did).is_some() {
+        let inputs = match ty_kind.unwrap() {
+            ty::Tuple(tys) => tys.iter().map(|t| t.expect_ty().clean(cx)).collect(),
+            _ => return GenericArgs::AngleBracketed { args, bindings },
+        };
+        let output = None;
+        // FIXME(#20299) return type comes from a projection now
+        // match types[1].kind {
+        //     ty::Tuple(ref v) if v.is_empty() => None, // -> ()
+        //     _ => Some(types[1].clean(cx))
+        // };
+        GenericArgs::Parenthesized { inputs, output }
+    } else {
+        GenericArgs::AngleBracketed { args, bindings }
     }
 }
 
-// trait_did should be set to a trait's DefId if called on a TraitRef, in order to sugar
-// from Fn<(A, B,), C> to Fn(A, B) -> C
 pub(super) fn external_path(
     cx: &mut DocContext<'_>,
-    name: Symbol,
-    trait_did: Option<DefId>,
+    did: DefId,
     has_self: bool,
     bindings: Vec<TypeBinding>,
     substs: SubstsRef<'_>,
 ) -> Path {
+    let def_kind = cx.tcx.def_kind(did);
+    let name = cx.tcx.item_name(did);
     Path {
-        global: false,
-        res: Res::Err,
+        res: Res::Def(def_kind, did),
         segments: vec![PathSegment {
             name,
-            args: external_generic_args(cx, trait_did, has_self, bindings, substs),
+            args: external_generic_args(cx, did, has_self, bindings, substs),
         }],
     }
 }
 
-crate fn strip_type(ty: Type) -> Type {
-    match ty {
-        Type::ResolvedPath { path, param_names, did, is_generic } => {
-            Type::ResolvedPath { path: strip_path(&path), param_names, did, is_generic }
-        }
-        Type::Tuple(inner_tys) => {
-            Type::Tuple(inner_tys.iter().map(|t| strip_type(t.clone())).collect())
-        }
-        Type::Slice(inner_ty) => Type::Slice(Box::new(strip_type(*inner_ty))),
-        Type::Array(inner_ty, s) => Type::Array(Box::new(strip_type(*inner_ty)), s),
-        Type::RawPointer(m, inner_ty) => Type::RawPointer(m, Box::new(strip_type(*inner_ty))),
-        Type::BorrowedRef { lifetime, mutability, type_ } => {
-            Type::BorrowedRef { lifetime, mutability, type_: Box::new(strip_type(*type_)) }
-        }
-        Type::QPath { name, self_type, trait_, self_def_id } => Type::QPath {
-            name,
-            self_def_id,
-            self_type: Box::new(strip_type(*self_type)),
-            trait_: Box::new(strip_type(*trait_)),
-        },
-        _ => ty,
-    }
-}
-
-crate fn strip_path(path: &Path) -> Path {
+/// Remove the generic arguments from a path.
+crate fn strip_path_generics(path: Path) -> Path {
     let segments = path
         .segments
         .iter()
@@ -195,13 +161,13 @@ crate fn strip_path(path: &Path) -> Path {
         })
         .collect();
 
-    Path { global: path.global, res: path.res, segments }
+    Path { res: path.res, segments }
 }
 
 crate fn qpath_to_string(p: &hir::QPath<'_>) -> String {
     let segments = match *p {
-        hir::QPath::Resolved(_, ref path) => &path.segments,
-        hir::QPath::TypeRelative(_, ref segment) => return segment.ident.to_string(),
+        hir::QPath::Resolved(_, path) => &path.segments,
+        hir::QPath::TypeRelative(_, segment) => return segment.ident.to_string(),
         hir::QPath::LangItem(lang_item, ..) => return lang_item.name().to_string(),
     };
 
@@ -238,22 +204,6 @@ crate fn build_deref_target_impls(cx: &mut DocContext<'_>, items: &[Item], ret: 
     }
 }
 
-crate trait ToSource {
-    fn to_src(&self, cx: &DocContext<'_>) -> String;
-}
-
-impl ToSource for rustc_span::Span {
-    fn to_src(&self, cx: &DocContext<'_>) -> String {
-        debug!("converting span {:?} to snippet", self);
-        let sn = match cx.sess().source_map().span_to_snippet(*self) {
-            Ok(x) => x,
-            Err(_) => String::new(),
-        };
-        debug!("got snippet {}", sn);
-        sn
-    }
-}
-
 crate fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
     use rustc_hir::*;
     debug!("trying to get a name from pattern: {:?}", p);
@@ -262,20 +212,15 @@ crate fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
         PatKind::Wild | PatKind::Struct(..) => return kw::Underscore,
         PatKind::Binding(_, _, ident, _) => return ident.name,
         PatKind::TupleStruct(ref p, ..) | PatKind::Path(ref p) => qpath_to_string(p),
-        PatKind::Or(ref pats) => pats
-            .iter()
-            .map(|p| name_from_pat(&**p).to_string())
-            .collect::<Vec<String>>()
-            .join(" | "),
-        PatKind::Tuple(ref elts, _) => format!(
+        PatKind::Or(pats) => {
+            pats.iter().map(|p| name_from_pat(p).to_string()).collect::<Vec<String>>().join(" | ")
+        }
+        PatKind::Tuple(elts, _) => format!(
             "({})",
-            elts.iter()
-                .map(|p| name_from_pat(&**p).to_string())
-                .collect::<Vec<String>>()
-                .join(", ")
+            elts.iter().map(|p| name_from_pat(p).to_string()).collect::<Vec<String>>().join(", ")
         ),
-        PatKind::Box(ref p) => return name_from_pat(&**p),
-        PatKind::Ref(ref p, _) => return name_from_pat(&**p),
+        PatKind::Box(p) => return name_from_pat(&*p),
+        PatKind::Ref(p, _) => return name_from_pat(&*p),
         PatKind::Lit(..) => {
             warn!(
                 "tried to get argument name from PatKind::Lit, which is silly in function arguments"
@@ -283,10 +228,10 @@ crate fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
             return Symbol::intern("()");
         }
         PatKind::Range(..) => return kw::Underscore,
-        PatKind::Slice(ref begin, ref mid, ref end) => {
-            let begin = begin.iter().map(|p| name_from_pat(&**p).to_string());
+        PatKind::Slice(begin, ref mid, end) => {
+            let begin = begin.iter().map(|p| name_from_pat(p).to_string());
             let mid = mid.as_ref().map(|p| format!("..{}", name_from_pat(&**p))).into_iter();
-            let end = end.iter().map(|p| name_from_pat(&**p).to_string());
+            let end = end.iter().map(|p| name_from_pat(p).to_string());
             format!("[{}]", begin.chain(mid).chain(end).collect::<Vec<_>>().join(", "))
         }
     })
@@ -294,7 +239,7 @@ crate fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
 
 crate fn print_const(cx: &DocContext<'_>, n: &'tcx ty::Const<'_>) -> String {
     match n.val {
-        ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs: _, promoted }) => {
+        ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs_: _, promoted }) => {
             let mut s = if let Some(def) = def.as_local() {
                 let hir_id = cx.tcx.hir().local_def_id_to_hir_id(def.did);
                 print_const_expr(cx.tcx, cx.tcx.hir().body_owned_by(hir_id))
@@ -416,22 +361,18 @@ crate fn print_const_expr(tcx: TyCtxt<'_>, body: hir::BodyId) -> String {
 }
 
 /// Given a type Path, resolve it to a Type using the TyCtxt
-crate fn resolve_type(cx: &mut DocContext<'_>, path: Path, id: hir::HirId) -> Type {
-    debug!("resolve_type({:?},{:?})", path, id);
+crate fn resolve_type(cx: &mut DocContext<'_>, path: Path) -> Type {
+    debug!("resolve_type({:?})", path);
 
-    let is_generic = match path.res {
-        Res::PrimTy(p) => return Primitive(PrimitiveType::from(p)),
-        Res::SelfTy(..) if path.segments.len() == 1 => {
-            return Generic(kw::SelfUpper);
+    match path.res {
+        Res::PrimTy(p) => Primitive(PrimitiveType::from(p)),
+        Res::SelfTy(..) if path.segments.len() == 1 => Generic(kw::SelfUpper),
+        Res::Def(DefKind::TyParam, _) if path.segments.len() == 1 => Generic(path.segments[0].name),
+        _ => {
+            let did = register_res(cx, path.res);
+            ResolvedPath { path, did }
         }
-        Res::Def(DefKind::TyParam, _) if path.segments.len() == 1 => {
-            return Generic(Symbol::intern(&path.whole_name()));
-        }
-        Res::SelfTy(..) | Res::Def(DefKind::TyParam | DefKind::AssocTy, _) => true,
-        _ => false,
-    };
-    let did = register_res(cx, path.res);
-    ResolvedPath { path, param_names: None, did, is_generic }
+    }
 }
 
 crate fn get_auto_trait_and_blanket_impls(
@@ -489,8 +430,9 @@ crate fn register_res(cx: &mut DocContext<'_>, res: Res) -> DefId {
         | Res::NonMacroAttr(_)
         | Res::Err => return res.def_id(),
         Res::Def(
-            TyParam | ConstParam | Ctor(..) | ExternCrate | Use | ForeignMod | AnonConst | OpaqueTy
-            | Field | LifetimeParam | GlobalAsm | Impl | Closure | Generator,
+            TyParam | ConstParam | Ctor(..) | ExternCrate | Use | ForeignMod | AnonConst
+            | InlineConst | OpaqueTy | Field | LifetimeParam | GlobalAsm | Impl | Closure
+            | Generator,
             id,
         ) => return id,
     };
@@ -561,4 +503,57 @@ crate fn has_doc_flag(attrs: ty::Attributes<'_>, flag: Symbol) -> bool {
 /// so that the channel is consistent.
 ///
 /// Set by `bootstrap::Builder::doc_rust_lang_org_channel` in order to keep tests passing on beta/stable.
-crate const DOC_RUST_LANG_ORG_CHANNEL: &'static str = env!("DOC_RUST_LANG_ORG_CHANNEL");
+crate const DOC_RUST_LANG_ORG_CHANNEL: &str = env!("DOC_RUST_LANG_ORG_CHANNEL");
+
+/// Render a sequence of macro arms in a format suitable for displaying to the user
+/// as part of an item declaration.
+pub(super) fn render_macro_arms<'a>(
+    matchers: impl Iterator<Item = &'a TokenTree>,
+    arm_delim: &str,
+) -> String {
+    let mut out = String::new();
+    for matcher in matchers {
+        writeln!(out, "    {} => {{ ... }}{}", render_macro_matcher(matcher), arm_delim).unwrap();
+    }
+    out
+}
+
+/// Render a macro matcher in a format suitable for displaying to the user
+/// as part of an item declaration.
+pub(super) fn render_macro_matcher(matcher: &TokenTree) -> String {
+    rustc_ast_pretty::pprust::tt_to_string(matcher)
+}
+
+pub(super) fn display_macro_source(
+    cx: &mut DocContext<'_>,
+    name: Symbol,
+    def: &ast::MacroDef,
+    def_id: DefId,
+    vis: impl Clean<Visibility>,
+) -> String {
+    let tts: Vec<_> = def.body.inner_tokens().into_trees().collect();
+    // Extract the spans of all matchers. They represent the "interface" of the macro.
+    let matchers = tts.chunks(4).map(|arm| &arm[0]);
+
+    if def.macro_rules {
+        format!("macro_rules! {} {{\n{}}}", name, render_macro_arms(matchers, ";"))
+    } else {
+        let vis = vis.clean(cx);
+
+        if matchers.len() <= 1 {
+            format!(
+                "{}macro {}{} {{\n    ...\n}}",
+                vis.to_src_with_space(cx.tcx, def_id),
+                name,
+                matchers.map(render_macro_matcher).collect::<String>(),
+            )
+        } else {
+            format!(
+                "{}macro {} {{\n{}}}",
+                vis.to_src_with_space(cx.tcx, def_id),
+                name,
+                render_macro_arms(matchers, ","),
+            )
+        }
+    }
+}

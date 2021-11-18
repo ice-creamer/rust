@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::in_macro;
-use rustc_ast::ast::{AssocItemKind, Extern, FnKind, FnSig, ImplKind, Item, ItemKind, TraitKind, Ty, TyKind};
+use rustc_ast::ast::{AssocItemKind, Extern, Fn, FnSig, Impl, Item, ItemKind, Trait, Ty, TyKind};
 use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::{sym, Span};
@@ -8,19 +8,19 @@ use rustc_span::{sym, Span};
 use std::convert::TryInto;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for excessive
+    /// ### What it does
+    /// Checks for excessive
     /// use of bools in structs.
     ///
-    /// **Why is this bad?** Excessive bools in a struct
+    /// ### Why is this bad?
+    /// Excessive bools in a struct
     /// is often a sign that it's used as a state machine,
     /// which is much better implemented as an enum.
     /// If it's not the case, excessive bools usually benefit
     /// from refactoring into two-variant enums for better
     /// readability and API.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// Bad:
     /// ```rust
     /// struct S {
@@ -44,19 +44,19 @@ declare_clippy_lint! {
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for excessive use of
+    /// ### What it does
+    /// Checks for excessive use of
     /// bools in function definitions.
     ///
-    /// **Why is this bad?** Calls to such functions
+    /// ### Why is this bad?
+    /// Calls to such functions
     /// are confusing and error prone, because it's
     /// hard to remember argument order and you have
     /// no type system support to back you up. Using
     /// two-variant enums instead of bools often makes
     /// API easier to use.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// Bad:
     /// ```rust,ignore
     /// fn f(is_round: bool, is_hot: bool) { ... }
@@ -162,17 +162,17 @@ impl EarlyLintPass for ExcessiveBools {
                     );
                 }
             },
-            ItemKind::Impl(box ImplKind {
+            ItemKind::Impl(box Impl {
                 of_trait: None, items, ..
             })
-            | ItemKind::Trait(box TraitKind(.., items)) => {
+            | ItemKind::Trait(box Trait { items, .. }) => {
                 for item in items {
-                    if let AssocItemKind::Fn(box FnKind(_, fn_sig, _, _)) = &item.kind {
-                        self.check_fn_sig(cx, fn_sig, item.span);
+                    if let AssocItemKind::Fn(box Fn { sig, .. }) = &item.kind {
+                        self.check_fn_sig(cx, sig, item.span);
                     }
                 }
             },
-            ItemKind::Fn(box FnKind(_, fn_sig, _, _)) => self.check_fn_sig(cx, fn_sig, item.span),
+            ItemKind::Fn(box Fn { sig, .. }) => self.check_fn_sig(cx, sig, item.span),
             _ => (),
         }
     }

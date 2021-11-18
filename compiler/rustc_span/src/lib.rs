@@ -16,6 +16,7 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(array_windows)]
 #![feature(crate_visibility_modifier)]
+#![feature(if_let_guard)]
 #![feature(negative_impls)]
 #![feature(nll)]
 #![feature(min_specialization)]
@@ -23,6 +24,9 @@
 
 #[macro_use]
 extern crate rustc_macros;
+
+#[macro_use]
+extern crate tracing;
 
 use rustc_data_structures::AtomicRef;
 use rustc_macros::HashStable_Generic;
@@ -36,16 +40,14 @@ use source_map::SourceMap;
 pub mod edition;
 use edition::Edition;
 pub mod hygiene;
-pub use hygiene::SyntaxContext;
 use hygiene::Transparency;
-pub use hygiene::{DesugaringKind, ExpnData, ExpnId, ExpnKind, ForLoopLoc, MacroKind};
+pub use hygiene::{DesugaringKind, ExpnKind, ForLoopLoc, MacroKind};
+pub use hygiene::{ExpnData, ExpnHash, ExpnId, LocalExpnId, SyntaxContext};
 pub mod def_id;
-use def_id::{CrateNum, DefId, DefPathHash, LOCAL_CRATE};
+use def_id::{CrateNum, DefId, DefPathHash, LocalDefId, LOCAL_CRATE};
 pub mod lev_distance;
 mod span_encoding;
 pub use span_encoding::{Span, DUMMY_SP};
-
-pub mod crate_disambiguator;
 
 pub mod symbol;
 pub use symbol::{sym, Symbol};
@@ -53,19 +55,16 @@ pub use symbol::{sym, Symbol};
 mod analyze_source_file;
 pub mod fatal_error;
 
-use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::sync::{Lock, Lrc};
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::fmt;
 use std::hash::Hash;
 use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::thread::LocalKey;
 
 use md5::Md5;
 use sha1::Digest;
@@ -82,7 +81,7 @@ mod tests;
 // threads within the compilation session, but is not accessible outside the
 // session.
 pub struct SessionGlobals {
-    symbol_interner: Lock<symbol::Interner>,
+    symbol_interner: symbol::Interner,
     span_interner: Lock<span_encoding::SpanInterner>,
     hygiene_data: Lock<hygiene::HygieneData>,
     source_map: Lock<Option<Lrc<SourceMap>>>,
@@ -91,7 +90,7 @@ pub struct SessionGlobals {
 impl SessionGlobals {
     pub fn new(edition: Edition) -> SessionGlobals {
         SessionGlobals {
-            symbol_interner: Lock::new(symbol::Interner::fresh()),
+            symbol_interner: symbol::Interner::fresh(),
             span_interner: Lock::new(span_encoding::SpanInterner::default()),
             hygiene_data: Lock::new(hygiene::HygieneData::new(edition)),
             source_map: Lock::new(None),
@@ -99,24 +98,70 @@ impl SessionGlobals {
     }
 }
 
-pub fn with_session_globals<R>(edition: Edition, f: impl FnOnce() -> R) -> R {
+#[inline]
+pub fn create_session_globals_then<R>(edition: Edition, f: impl FnOnce() -> R) -> R {
+    assert!(
+        !SESSION_GLOBALS.is_set(),
+        "SESSION_GLOBALS should never be overwritten! \
+         Use another thread if you need another SessionGlobals"
+    );
     let session_globals = SessionGlobals::new(edition);
     SESSION_GLOBALS.set(&session_globals, f)
 }
 
-pub fn with_default_session_globals<R>(f: impl FnOnce() -> R) -> R {
-    with_session_globals(edition::DEFAULT_EDITION, f)
+#[inline]
+pub fn set_session_globals_then<R>(session_globals: &SessionGlobals, f: impl FnOnce() -> R) -> R {
+    assert!(
+        !SESSION_GLOBALS.is_set(),
+        "SESSION_GLOBALS should never be overwritten! \
+         Use another thread if you need another SessionGlobals"
+    );
+    SESSION_GLOBALS.set(session_globals, f)
+}
+
+#[inline]
+pub fn create_default_session_if_not_set_then<R, F>(f: F) -> R
+where
+    F: FnOnce(&SessionGlobals) -> R,
+{
+    create_session_if_not_set_then(edition::DEFAULT_EDITION, f)
+}
+
+#[inline]
+pub fn create_session_if_not_set_then<R, F>(edition: Edition, f: F) -> R
+where
+    F: FnOnce(&SessionGlobals) -> R,
+{
+    if !SESSION_GLOBALS.is_set() {
+        let session_globals = SessionGlobals::new(edition);
+        SESSION_GLOBALS.set(&session_globals, || SESSION_GLOBALS.with(f))
+    } else {
+        SESSION_GLOBALS.with(f)
+    }
+}
+
+#[inline]
+pub fn with_session_globals<R, F>(f: F) -> R
+where
+    F: FnOnce(&SessionGlobals) -> R,
+{
+    SESSION_GLOBALS.with(f)
+}
+
+#[inline]
+pub fn create_default_session_globals_then<R>(f: impl FnOnce() -> R) -> R {
+    create_session_globals_then(edition::DEFAULT_EDITION, f)
 }
 
 // If this ever becomes non thread-local, `decode_syntax_context`
 // and `decode_expn_id` will need to be updated to handle concurrent
 // deserialization.
-scoped_tls::scoped_thread_local!(pub static SESSION_GLOBALS: SessionGlobals);
+scoped_tls::scoped_thread_local!(static SESSION_GLOBALS: SessionGlobals);
 
 // FIXME: We should use this enum or something like it to get rid of the
 // use of magic `/rust/1.x/...` paths across the board.
 #[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd)]
-#[derive(HashStable_Generic, Decodable)]
+#[derive(Decodable)]
 pub enum RealFileName {
     LocalPath(PathBuf),
     /// For remapped paths (namely paths into libstd that have been mapped
@@ -149,10 +194,8 @@ impl<S: Encoder> Encodable<S> for RealFileName {
         encoder.emit_enum(|encoder| match *self {
             RealFileName::LocalPath(ref local_path) => {
                 encoder.emit_enum_variant("LocalPath", 0, 1, |encoder| {
-                    Ok({
-                        encoder
-                            .emit_enum_variant_arg(true, |encoder| local_path.encode(encoder))?;
-                    })
+                    encoder.emit_enum_variant_arg(true, |encoder| local_path.encode(encoder))?;
+                    Ok(())
                 })
             }
 
@@ -161,12 +204,9 @@ impl<S: Encoder> Encodable<S> for RealFileName {
                     // For privacy and build reproducibility, we must not embed host-dependant path in artifacts
                     // if they have been remapped by --remap-path-prefix
                     assert!(local_path.is_none());
-                    Ok({
-                        encoder
-                            .emit_enum_variant_arg(true, |encoder| local_path.encode(encoder))?;
-                        encoder
-                            .emit_enum_variant_arg(false, |encoder| virtual_name.encode(encoder))?;
-                    })
+                    encoder.emit_enum_variant_arg(true, |encoder| local_path.encode(encoder))?;
+                    encoder.emit_enum_variant_arg(false, |encoder| virtual_name.encode(encoder))?;
+                    Ok(())
                 }),
         })
     }
@@ -217,18 +257,19 @@ impl RealFileName {
         }
     }
 
-    pub fn to_string_lossy(&self, prefer_local: bool) -> Cow<'_, str> {
-        if prefer_local {
-            self.local_path_if_available().to_string_lossy()
-        } else {
-            self.remapped_path_if_available().to_string_lossy()
+    pub fn to_string_lossy(&self, display_pref: FileNameDisplayPreference) -> Cow<'_, str> {
+        match display_pref {
+            FileNameDisplayPreference::Local => self.local_path_if_available().to_string_lossy(),
+            FileNameDisplayPreference::Remapped => {
+                self.remapped_path_if_available().to_string_lossy()
+            }
         }
     }
 }
 
 /// Differentiates between real files and common virtual files.
 #[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Hash)]
-#[derive(HashStable_Generic, Decodable, Encodable)]
+#[derive(Decodable, Encodable)]
 pub enum FileName {
     Real(RealFileName),
     /// Call to `quote!`.
@@ -257,9 +298,15 @@ impl From<PathBuf> for FileName {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub enum FileNameDisplayPreference {
+    Remapped,
+    Local,
+}
+
 pub struct FileNameDisplay<'a> {
     inner: &'a FileName,
-    prefer_local: bool,
+    display_pref: FileNameDisplayPreference,
 }
 
 impl fmt::Display for FileNameDisplay<'_> {
@@ -267,7 +314,7 @@ impl fmt::Display for FileNameDisplay<'_> {
         use FileName::*;
         match *self.inner {
             Real(ref name) => {
-                write!(fmt, "{}", name.to_string_lossy(self.prefer_local))
+                write!(fmt, "{}", name.to_string_lossy(self.display_pref))
             }
             QuoteExpansion(_) => write!(fmt, "<quote expansion>"),
             MacroExpansion(_) => write!(fmt, "<macro expansion>"),
@@ -285,7 +332,7 @@ impl fmt::Display for FileNameDisplay<'_> {
 impl FileNameDisplay<'_> {
     pub fn to_string_lossy(&self) -> Cow<'_, str> {
         match self.inner {
-            FileName::Real(ref inner) => inner.to_string_lossy(self.prefer_local),
+            FileName::Real(ref inner) => inner.to_string_lossy(self.display_pref),
             _ => Cow::from(format!("{}", self)),
         }
     }
@@ -309,13 +356,17 @@ impl FileName {
     }
 
     pub fn prefer_remapped(&self) -> FileNameDisplay<'_> {
-        FileNameDisplay { inner: self, prefer_local: false }
+        FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Remapped }
     }
 
     // This may include transient local filesystem information.
     // Must not be embedded in build outputs.
     pub fn prefer_local(&self) -> FileNameDisplay<'_> {
-        FileNameDisplay { inner: self, prefer_local: true }
+        FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Local }
+    }
+
+    pub fn display(&self, display_pref: FileNameDisplayPreference) -> FileNameDisplay<'_> {
+        FileNameDisplay { inner: self, display_pref }
     }
 
     pub fn macro_expansion_source_code(src: &str) -> FileName {
@@ -381,24 +432,38 @@ pub struct SpanData {
     /// Information about where the macro came from, if this piece of
     /// code was created by a macro expansion.
     pub ctxt: SyntaxContext,
+    pub parent: Option<LocalDefId>,
 }
 
 impl SpanData {
     #[inline]
     pub fn span(&self) -> Span {
-        Span::new(self.lo, self.hi, self.ctxt)
+        Span::new(self.lo, self.hi, self.ctxt, self.parent)
     }
     #[inline]
     pub fn with_lo(&self, lo: BytePos) -> Span {
-        Span::new(lo, self.hi, self.ctxt)
+        Span::new(lo, self.hi, self.ctxt, self.parent)
     }
     #[inline]
     pub fn with_hi(&self, hi: BytePos) -> Span {
-        Span::new(self.lo, hi, self.ctxt)
+        Span::new(self.lo, hi, self.ctxt, self.parent)
     }
     #[inline]
     pub fn with_ctxt(&self, ctxt: SyntaxContext) -> Span {
-        Span::new(self.lo, self.hi, ctxt)
+        Span::new(self.lo, self.hi, ctxt, self.parent)
+    }
+    #[inline]
+    pub fn with_parent(&self, parent: Option<LocalDefId>) -> Span {
+        Span::new(self.lo, self.hi, self.ctxt, parent)
+    }
+    /// Returns `true` if this is a dummy span with any hygienic context.
+    #[inline]
+    pub fn is_dummy(self) -> bool {
+        self.lo.0 == 0 && self.hi.0 == 0
+    }
+    /// Returns `true` if `self` fully encloses `other`.
+    pub fn contains(self, other: Self) -> bool {
+        self.lo <= other.lo && other.hi <= self.hi
     }
 }
 
@@ -454,18 +519,25 @@ impl Span {
     }
     #[inline]
     pub fn ctxt(self) -> SyntaxContext {
-        self.data().ctxt
+        self.data_untracked().ctxt
     }
     #[inline]
     pub fn with_ctxt(self, ctxt: SyntaxContext) -> Span {
-        self.data().with_ctxt(ctxt)
+        self.data_untracked().with_ctxt(ctxt)
+    }
+    #[inline]
+    pub fn parent(self) -> Option<LocalDefId> {
+        self.data().parent
+    }
+    #[inline]
+    pub fn with_parent(self, ctxt: Option<LocalDefId>) -> Span {
+        self.data().with_parent(ctxt)
     }
 
     /// Returns `true` if this is a dummy span with any hygienic context.
     #[inline]
     pub fn is_dummy(self) -> bool {
-        let span = self.data();
-        span.lo.0 == 0 && span.hi.0 == 0
+        self.data_untracked().is_dummy()
     }
 
     /// Returns `true` if this span comes from a macro or desugaring.
@@ -476,34 +548,31 @@ impl Span {
 
     /// Returns `true` if `span` originates in a derive-macro's expansion.
     pub fn in_derive_expansion(self) -> bool {
-        matches!(
-            self.ctxt().outer_expn_data().kind,
-            ExpnKind::Macro { kind: MacroKind::Derive, name: _, proc_macro: _ }
-        )
+        matches!(self.ctxt().outer_expn_data().kind, ExpnKind::Macro(MacroKind::Derive, _))
     }
 
     #[inline]
     pub fn with_root_ctxt(lo: BytePos, hi: BytePos) -> Span {
-        Span::new(lo, hi, SyntaxContext::root())
+        Span::new(lo, hi, SyntaxContext::root(), None)
     }
 
     /// Returns a new span representing an empty span at the beginning of this span.
     #[inline]
     pub fn shrink_to_lo(self) -> Span {
-        let span = self.data();
+        let span = self.data_untracked();
         span.with_hi(span.lo)
     }
     /// Returns a new span representing an empty span at the end of this span.
     #[inline]
     pub fn shrink_to_hi(self) -> Span {
-        let span = self.data();
+        let span = self.data_untracked();
         span.with_lo(span.hi)
     }
 
     #[inline]
     /// Returns `true` if `hi == lo`.
     pub fn is_empty(&self) -> bool {
-        let span = self.data();
+        let span = self.data_untracked();
         span.hi == span.lo
     }
 
@@ -516,7 +585,7 @@ impl Span {
     pub fn contains(self, other: Span) -> bool {
         let span = self.data();
         let other = other.data();
-        span.lo <= other.lo && other.hi <= span.hi
+        span.contains(other)
     }
 
     /// Returns `true` if `self` touches `other`.
@@ -552,9 +621,17 @@ impl Span {
 
     /// The `Span` for the tokens in the previous macro expansion from which `self` was generated,
     /// if any.
-    pub fn parent(self) -> Option<Span> {
+    pub fn parent_callsite(self) -> Option<Span> {
         let expn_data = self.ctxt().outer_expn_data();
         if !expn_data.is_root() { Some(expn_data.call_site) } else { None }
+    }
+
+    /// Walk down the expansion ancestors to find a span that's contained within `outer`.
+    pub fn find_ancestor_inside(mut self, outer: Span) -> Option<Span> {
+        while !outer.contains(self) {
+            self = self.parent_callsite()?;
+        }
+        Some(self)
     }
 
     /// Edition of the crate from which this span came.
@@ -673,6 +750,7 @@ impl Span {
             cmp::min(span_data.lo, end_data.lo),
             cmp::max(span_data.hi, end_data.hi),
             if span_data.ctxt == SyntaxContext::root() { end_data.ctxt } else { span_data.ctxt },
+            if span_data.parent == end_data.parent { span_data.parent } else { None },
         )
     }
 
@@ -690,6 +768,7 @@ impl Span {
             span.hi,
             end.lo,
             if end.ctxt == SyntaxContext::root() { end.ctxt } else { span.ctxt },
+            if span.parent == end.parent { span.parent } else { None },
         )
     }
 
@@ -701,12 +780,30 @@ impl Span {
     ///     ^^^^^^^^^^^^^^^^^
     /// ```
     pub fn until(self, end: Span) -> Span {
-        let span = self.data();
-        let end = end.data();
+        // Most of this function's body is copied from `to`.
+        // We can't just do `self.to(end.shrink_to_lo())`,
+        // because to also does some magic where it uses min/max so
+        // it can handle overlapping spans. Some advanced mis-use of
+        // `until` with different ctxts makes this visible.
+        let span_data = self.data();
+        let end_data = end.data();
+        // FIXME(jseyfried): `self.ctxt` should always equal `end.ctxt` here (cf. issue #23480).
+        // Return the macro span on its own to avoid weird diagnostic output. It is preferable to
+        // have an incomplete span than a completely nonsensical one.
+        if span_data.ctxt != end_data.ctxt {
+            if span_data.ctxt == SyntaxContext::root() {
+                return end;
+            } else if end_data.ctxt == SyntaxContext::root() {
+                return self;
+            }
+            // Both spans fall within a macro.
+            // FIXME(estebank): check if it is the *same* macro.
+        }
         Span::new(
-            span.lo,
-            end.lo,
-            if end.ctxt == SyntaxContext::root() { end.ctxt } else { span.ctxt },
+            span_data.lo,
+            end_data.lo,
+            if end_data.ctxt == SyntaxContext::root() { end_data.ctxt } else { span_data.ctxt },
+            if span_data.parent == end_data.parent { span_data.parent } else { None },
         )
     }
 
@@ -716,6 +813,7 @@ impl Span {
             span.lo + BytePos::from_usize(inner.start),
             span.lo + BytePos::from_usize(inner.end),
             span.ctxt,
+            span.parent,
         )
     }
 
@@ -754,7 +852,7 @@ impl Span {
     pub fn remove_mark(&mut self) -> ExpnId {
         let mut span = self.data();
         let mark = span.ctxt.remove_mark();
-        *self = Span::new(span.lo, span.hi, span.ctxt);
+        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
         mark
     }
 
@@ -762,7 +860,7 @@ impl Span {
     pub fn adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
         let mut span = self.data();
         let mark = span.ctxt.adjust(expn_id);
-        *self = Span::new(span.lo, span.hi, span.ctxt);
+        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
         mark
     }
 
@@ -770,7 +868,7 @@ impl Span {
     pub fn normalize_to_macros_2_0_and_adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
         let mut span = self.data();
         let mark = span.ctxt.normalize_to_macros_2_0_and_adjust(expn_id);
-        *self = Span::new(span.lo, span.hi, span.ctxt);
+        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
         mark
     }
 
@@ -778,7 +876,7 @@ impl Span {
     pub fn glob_adjust(&mut self, expn_id: ExpnId, glob_span: Span) -> Option<Option<ExpnId>> {
         let mut span = self.data();
         let mark = span.ctxt.glob_adjust(expn_id, glob_span);
-        *self = Span::new(span.lo, span.hi, span.ctxt);
+        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
         mark
     }
 
@@ -790,7 +888,7 @@ impl Span {
     ) -> Option<Option<ExpnId>> {
         let mut span = self.data();
         let mark = span.ctxt.reverse_glob_adjust(expn_id, glob_span);
-        *self = Span::new(span.lo, span.hi, span.ctxt);
+        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
         mark
     }
 
@@ -842,7 +940,7 @@ impl<D: Decoder> Decodable<D> for Span {
             let lo = d.read_struct_field("lo", Decodable::decode)?;
             let hi = d.read_struct_field("hi", Decodable::decode)?;
 
-            Ok(Span::new(lo, hi, SyntaxContext::root()))
+            Ok(Span::new(lo, hi, SyntaxContext::root(), None))
         })
     }
 }
@@ -857,13 +955,13 @@ impl<D: Decoder> Decodable<D> for Span {
 /// the `SourceMap` provided to this function. If that is not available,
 /// we fall back to printing the raw `Span` field values.
 pub fn with_source_map<T, F: FnOnce() -> T>(source_map: Lrc<SourceMap>, f: F) -> T {
-    SESSION_GLOBALS.with(|session_globals| {
+    with_session_globals(|session_globals| {
         *session_globals.source_map.borrow_mut() = Some(source_map);
     });
     struct ClearSourceMap;
     impl Drop for ClearSourceMap {
         fn drop(&mut self) {
-            SESSION_GLOBALS.with(|session_globals| {
+            with_session_globals(|session_globals| {
                 session_globals.source_map.borrow_mut().take();
             });
         }
@@ -882,7 +980,7 @@ pub fn debug_with_source_map(
 }
 
 pub fn default_span_debug(span: Span, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    SESSION_GLOBALS.with(|session_globals| {
+    with_session_globals(|session_globals| {
         if let Some(source_map) = &*session_globals.source_map.borrow() {
             debug_with_source_map(span, f, source_map)
         } else {
@@ -903,7 +1001,7 @@ impl fmt::Debug for Span {
 
 impl fmt::Debug for SpanData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (*SPAN_DEBUG)(Span::new(self.lo, self.hi, self.ctxt), f)
+        (*SPAN_DEBUG)(Span::new(self.lo, self.hi, self.ctxt, self.parent), f)
     }
 }
 
@@ -1508,13 +1606,11 @@ impl SourceFile {
     /// number. If the source_file is empty or the position is located before the
     /// first line, `None` is returned.
     pub fn lookup_line(&self, pos: BytePos) -> Option<usize> {
-        if self.lines.is_empty() {
-            return None;
+        match self.lines.binary_search(&pos) {
+            Ok(idx) => Some(idx),
+            Err(0) => None,
+            Err(idx) => Some(idx - 1),
         }
-
-        let line_index = lookup_line(&self.lines[..], pos);
-        assert!(line_index < self.lines.len() as isize);
-        if line_index >= 0 { Some(line_index as usize) } else { None }
     }
 
     pub fn line_bounds(&self, line_index: usize) -> Range<BytePos> {
@@ -1866,6 +1962,7 @@ pub struct FileLines {
 
 pub static SPAN_DEBUG: AtomicRef<fn(Span, &mut fmt::Formatter<'_>) -> fmt::Result> =
     AtomicRef::new(&(default_span_debug as fn(_, &mut fmt::Formatter<'_>) -> _));
+pub static SPAN_TRACK: AtomicRef<fn(LocalDefId)> = AtomicRef::new(&((|_| {}) as fn(_)));
 
 // _____________________________________________________________________________
 // SpanLinesError, SpanSnippetError, DistinctSources, MalformedSourceMapPositions
@@ -1913,28 +2010,14 @@ impl InnerSpan {
     }
 }
 
-// Given a slice of line start positions and a position, returns the index of
-// the line the position is on. Returns -1 if the position is located before
-// the first line.
-fn lookup_line(lines: &[BytePos], pos: BytePos) -> isize {
-    match lines.binary_search(&pos) {
-        Ok(line) => line as isize,
-        Err(line) => line as isize - 1,
-    }
-}
-
 /// Requirements for a `StableHashingContext` to be used in this crate.
 ///
 /// This is a hack to allow using the [`HashStable_Generic`] derive macro
 /// instead of implementing everything in rustc_middle.
 pub trait HashStableContext {
     fn def_path_hash(&self, def_id: DefId) -> DefPathHash;
-    /// Obtains a cache for storing the `Fingerprint` of an `ExpnId`.
-    /// This method allows us to have multiple `HashStableContext` implementations
-    /// that hash things in a different way, without the results of one polluting
-    /// the cache of the other.
-    fn expn_id_cache() -> &'static LocalKey<ExpnIdCache>;
     fn hash_spans(&self) -> bool;
+    fn def_span(&self, def_id: LocalDefId) -> Span;
     fn span_data_to_lines_and_cols(
         &mut self,
         span: &SpanData,
@@ -1958,22 +2041,35 @@ where
     fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
         const TAG_VALID_SPAN: u8 = 0;
         const TAG_INVALID_SPAN: u8 = 1;
+        const TAG_RELATIVE_SPAN: u8 = 2;
 
         if !ctx.hash_spans() {
             return;
         }
 
-        self.ctxt().hash_stable(ctx, hasher);
+        let span = self.data_untracked();
+        span.ctxt.hash_stable(ctx, hasher);
+        span.parent.hash_stable(ctx, hasher);
 
-        if self.is_dummy() {
+        if span.is_dummy() {
             Hash::hash(&TAG_INVALID_SPAN, hasher);
             return;
+        }
+
+        if let Some(parent) = span.parent {
+            let def_span = ctx.def_span(parent).data_untracked();
+            if def_span.contains(span) {
+                // This span is enclosed in a definition: only hash the relative position.
+                Hash::hash(&TAG_RELATIVE_SPAN, hasher);
+                (span.lo - def_span.lo).to_u32().hash_stable(ctx, hasher);
+                (span.hi - def_span.lo).to_u32().hash_stable(ctx, hasher);
+                return;
+            }
         }
 
         // If this is not an empty or invalid span, we want to hash the last
         // position that belongs to it, as opposed to hashing the first
         // position past it.
-        let span = self.data();
         let (file, line_lo, col_lo, line_hi, col_hi) = match ctx.span_data_to_lines_and_cols(&span)
         {
             Some(pos) => pos,
@@ -2005,62 +2101,5 @@ where
         let len = (span.hi - span.lo).0;
         Hash::hash(&col_line, hasher);
         Hash::hash(&len, hasher);
-    }
-}
-
-impl<CTX: HashStableContext> HashStable<CTX> for SyntaxContext {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        const TAG_EXPANSION: u8 = 0;
-        const TAG_NO_EXPANSION: u8 = 1;
-
-        if *self == SyntaxContext::root() {
-            TAG_NO_EXPANSION.hash_stable(ctx, hasher);
-        } else {
-            TAG_EXPANSION.hash_stable(ctx, hasher);
-            let (expn_id, transparency) = self.outer_mark();
-            expn_id.hash_stable(ctx, hasher);
-            transparency.hash_stable(ctx, hasher);
-        }
-    }
-}
-
-pub type ExpnIdCache = RefCell<Vec<Option<Fingerprint>>>;
-
-impl<CTX: HashStableContext> HashStable<CTX> for ExpnId {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        const TAG_ROOT: u8 = 0;
-        const TAG_NOT_ROOT: u8 = 1;
-
-        if *self == ExpnId::root() {
-            TAG_ROOT.hash_stable(ctx, hasher);
-            return;
-        }
-
-        // Since the same expansion context is usually referenced many
-        // times, we cache a stable hash of it and hash that instead of
-        // recursing every time.
-        let index = self.as_u32() as usize;
-        let res = CTX::expn_id_cache().with(|cache| cache.borrow().get(index).copied().flatten());
-
-        if let Some(res) = res {
-            res.hash_stable(ctx, hasher);
-        } else {
-            let new_len = index + 1;
-
-            let mut sub_hasher = StableHasher::new();
-            TAG_NOT_ROOT.hash_stable(ctx, &mut sub_hasher);
-            self.expn_data().hash_stable(ctx, &mut sub_hasher);
-            let sub_hash: Fingerprint = sub_hasher.finish();
-
-            CTX::expn_id_cache().with(|cache| {
-                let mut cache = cache.borrow_mut();
-                if cache.len() < new_len {
-                    cache.resize(new_len, None);
-                }
-                let prev = cache[index].replace(sub_hash);
-                assert_eq!(prev, None, "Cache slot was filled");
-            });
-            sub_hash.hash_stable(ctx, hasher);
-        }
     }
 }

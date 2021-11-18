@@ -195,6 +195,15 @@
     test(no_crate_inject, attr(deny(warnings))),
     test(attr(allow(dead_code, deprecated, unused_variables, unused_mut)))
 )]
+#![cfg_attr(
+    not(bootstrap),
+    doc(cfg_hide(
+        not(test),
+        not(any(test, bootstrap)),
+        no_global_oom_handling,
+        not(no_global_oom_handling)
+    ))
+)]
 // Don't link to std. We are std.
 #![no_std]
 #![warn(deprecated_in_future)]
@@ -225,15 +234,18 @@
 #![feature(allocator_internals)]
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
-#![feature(async_stream)]
 #![feature(arbitrary_self_types)]
 #![feature(array_error_internals)]
 #![feature(asm)]
 #![feature(assert_matches)]
 #![feature(associated_type_bounds)]
+#![feature(async_stream)]
 #![feature(atomic_mut_ptr)]
+#![feature(auto_traits)]
 #![feature(bench_black_box)]
+#![feature(bool_to_option)]
 #![feature(box_syntax)]
+#![feature(c_unwind)]
 #![feature(c_variadic)]
 #![feature(cfg_accessible)]
 #![feature(cfg_eval)]
@@ -244,29 +256,36 @@
 #![feature(concat_idents)]
 #![feature(const_cstr_unchecked)]
 #![feature(const_fn_floating_point_arithmetic)]
-#![feature(const_fn_transmute)]
 #![feature(const_fn_fn_ptr_basics)]
+#![feature(const_fn_trait_bound)]
+#![feature(const_format_args)]
 #![feature(const_io_structs)]
 #![feature(const_ip)]
-#![feature(const_ipv6)]
-#![feature(const_raw_ptr_deref)]
-#![feature(const_socketaddr)]
 #![feature(const_ipv4)]
+#![feature(const_ipv6)]
+#![feature(const_option)]
+#![cfg_attr(bootstrap, feature(const_raw_ptr_deref))]
+#![cfg_attr(not(bootstrap), feature(const_mut_refs))]
+#![feature(const_socketaddr)]
+#![feature(const_trait_impl)]
 #![feature(container_error_extra)]
 #![feature(core_intrinsics)]
+#![feature(core_panic)]
 #![feature(custom_test_frameworks)]
 #![feature(decl_macro)]
 #![feature(doc_cfg)]
+#![feature(doc_cfg_hide)]
 #![feature(doc_keyword)]
 #![feature(doc_masked)]
 #![feature(doc_notable_trait)]
+#![feature(doc_primitive)]
 #![feature(dropck_eyepatch)]
+#![feature(duration_checked_float)]
 #![feature(duration_constants)]
 #![feature(edition_panic)]
 #![feature(exact_size_is_empty)]
 #![feature(exhaustive_patterns)]
 #![feature(extend_one)]
-#![cfg_attr(bootstrap, feature(extended_key_value_attributes))]
 #![feature(fn_traits)]
 #![feature(format_args_nl)]
 #![feature(gen_future)]
@@ -275,8 +294,8 @@
 #![feature(global_asm)]
 #![feature(hashmap_internals)]
 #![feature(int_error_internals)]
-#![feature(int_error_matching)]
 #![feature(integer_atomics)]
+#![feature(int_log)]
 #![feature(into_future)]
 #![feature(intra_doc_pointers)]
 #![feature(iter_zip)]
@@ -289,6 +308,8 @@
 #![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_uninit_array)]
 #![feature(min_specialization)]
+#![feature(mixed_integer_ops)]
+#![feature(must_not_suspend)]
 #![feature(needs_panic_runtime)]
 #![feature(negative_impls)]
 #![feature(never_type)]
@@ -296,19 +317,16 @@
 #![feature(nll)]
 #![feature(nonnull_slice_from_raw_parts)]
 #![feature(once_cell)]
-#![feature(auto_traits)]
 #![feature(panic_info_message)]
 #![feature(panic_internals)]
 #![feature(panic_unwind)]
 #![feature(pin_static_ref)]
-#![feature(prelude_2021)]
+#![cfg_attr(not(bootstrap), feature(portable_simd))]
 #![feature(prelude_import)]
 #![feature(ptr_internals)]
-#![feature(raw)]
-#![feature(ready_macro)]
 #![feature(rustc_attrs)]
 #![feature(rustc_private)]
-#![feature(shrink_to)]
+#![feature(saturating_int_impl)]
 #![feature(slice_concat_ext)]
 #![feature(slice_internals)]
 #![feature(slice_ptr_get)]
@@ -325,10 +343,9 @@
 #![feature(total_cmp)]
 #![feature(trace_macros)]
 #![feature(try_blocks)]
-#![feature(try_reserve)]
+#![feature(try_reserve_kind)]
 #![feature(unboxed_closures)]
-#![feature(unsafe_cell_raw_get)]
-#![feature(unwind_attributes)]
+#![feature(unwrap_infallible)]
 #![feature(vec_into_raw_parts)]
 #![feature(vec_spare_capacity)]
 // NB: the above list is sorted to minimize merge conflicts.
@@ -455,10 +472,10 @@ pub use core::pin;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::ptr;
 #[stable(feature = "rust1", since = "1.0.0")]
-#[allow(deprecated, deprecated_in_future)]
-pub use core::raw;
-#[stable(feature = "rust1", since = "1.0.0")]
 pub use core::result;
+#[unstable(feature = "portable_simd", issue = "86656")]
+#[cfg(not(bootstrap))]
+pub use core::simd;
 #[unstable(feature = "async_stream", issue = "79024")]
 pub use core::stream;
 #[stable(feature = "i128", since = "1.26.0")]
@@ -518,19 +535,19 @@ pub mod task {
     pub use alloc::task::*;
 }
 
-// Platform-abstraction modules
+// The runtime entry point and a few unstable public functions used by the
+// compiler
 #[macro_use]
-mod sys_common;
+pub mod rt;
+
+// Platform-abstraction modules
 mod sys;
+mod sys_common;
 
 pub mod alloc;
 
 // Private support modules
 mod panicking;
-
-// The runtime entry point and a few unstable public functions used by the
-// compiler
-pub mod rt;
 
 #[path = "../../backtrace/src/lib.rs"]
 #[allow(dead_code, unused_attributes)]
@@ -551,17 +568,17 @@ pub use std_detect::{
 #[stable(feature = "rust1", since = "1.0.0")]
 #[allow(deprecated, deprecated_in_future)]
 pub use core::{
-    assert_eq, assert_matches, assert_ne, debug_assert, debug_assert_eq, debug_assert_matches,
-    debug_assert_ne, matches, r#try, todo, unimplemented, unreachable, write, writeln,
+    assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne, matches, r#try, todo,
+    unimplemented, unreachable, write, writeln,
 };
 
 // Re-export built-in macros defined through libcore.
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow(deprecated)]
 pub use core::{
-    asm, assert, cfg, column, compile_error, concat, concat_idents, env, file, format_args,
-    format_args_nl, global_asm, include, include_bytes, include_str, line, llvm_asm, log_syntax,
-    module_path, option_env, stringify, trace_macros,
+    assert, assert_matches, cfg, column, compile_error, concat, concat_idents, const_format_args,
+    env, file, format_args, format_args_nl, include, include_bytes, include_str, line, llvm_asm,
+    log_syntax, module_path, option_env, stringify, trace_macros,
 };
 
 #[stable(feature = "core_primitive", since = "1.43.0")]

@@ -5,7 +5,6 @@
 use self::TyKind::*;
 
 use crate::infer::canonical::Canonical;
-use crate::ty::fold::BoundVarsCollector;
 use crate::ty::fold::ValidateBoundVars;
 use crate::ty::subst::{GenericArg, InternalSubsts, Subst, SubstsRef};
 use crate::ty::InferTy::{self, *};
@@ -240,7 +239,7 @@ static_assert_size!(TyKind<'_>, 32);
 ///   implements `CK<(u32, u32), Output = u32>`, where `CK` is the trait
 ///   specified above.
 /// - U is a type parameter representing the types of its upvars, tupled up
-///   (borrowed, if appropriate; that is, if an U field represents a by-ref upvar,
+///   (borrowed, if appropriate; that is, if a U field represents a by-ref upvar,
 ///    and the up-var has the type `Foo`, then that field of U will be `&Foo`).
 ///
 /// So, for example, given this function:
@@ -644,7 +643,7 @@ impl<'tcx> GeneratorSubsts<'tcx> {
     }
 
     /// This returns the types of the MIR locals which had to be stored across suspension points.
-    /// It is calculated in rustc_mir::transform::generator::StateTransform.
+    /// It is calculated in rustc_const_eval::transform::generator::StateTransform.
     /// All the types here must be in the tuple in GeneratorInterior.
     ///
     /// The locals are grouped by their variant number. Note that some locals may
@@ -702,6 +701,66 @@ impl<'tcx> UpvarSubsts<'tcx> {
             UpvarSubsts::Closure(substs) => substs.as_closure().tupled_upvars_ty(),
             UpvarSubsts::Generator(substs) => substs.as_generator().tupled_upvars_ty(),
         }
+    }
+}
+
+/// An inline const is modeled like
+///
+///     const InlineConst<'l0...'li, T0...Tj, R>: R;
+///
+/// where:
+///
+/// - 'l0...'li and T0...Tj are the generic parameters
+///   inherited from the item that defined the inline const,
+/// - R represents the type of the constant.
+///
+/// When the inline const is instantiated, `R` is substituted as the actual inferred
+/// type of the constant. The reason that `R` is represented as an extra type parameter
+/// is the same reason that [`ClosureSubsts`] have `CS` and `U` as type parameters:
+/// inline const can reference lifetimes that are internal to the creating function.
+#[derive(Copy, Clone, Debug, TypeFoldable)]
+pub struct InlineConstSubsts<'tcx> {
+    /// Generic parameters from the enclosing item,
+    /// concatenated with the inferred type of the constant.
+    pub substs: SubstsRef<'tcx>,
+}
+
+/// Struct returned by `split()`.
+pub struct InlineConstSubstsParts<'tcx, T> {
+    pub parent_substs: &'tcx [GenericArg<'tcx>],
+    pub ty: T,
+}
+
+impl<'tcx> InlineConstSubsts<'tcx> {
+    /// Construct `InlineConstSubsts` from `InlineConstSubstsParts`.
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        parts: InlineConstSubstsParts<'tcx, Ty<'tcx>>,
+    ) -> InlineConstSubsts<'tcx> {
+        InlineConstSubsts {
+            substs: tcx.mk_substs(
+                parts.parent_substs.iter().copied().chain(std::iter::once(parts.ty.into())),
+            ),
+        }
+    }
+
+    /// Divides the inline const substs into their respective components.
+    /// The ordering assumed here must match that used by `InlineConstSubsts::new` above.
+    fn split(self) -> InlineConstSubstsParts<'tcx, GenericArg<'tcx>> {
+        match self.substs[..] {
+            [ref parent_substs @ .., ty] => InlineConstSubstsParts { parent_substs, ty },
+            _ => bug!("inline const substs missing synthetics"),
+        }
+    }
+
+    /// Returns the substitutions of the inline const's parent.
+    pub fn parent_substs(self) -> &'tcx [GenericArg<'tcx>] {
+        self.split().parent_substs
+    }
+
+    /// Returns the type of this inline const.
+    pub fn ty(self) -> Ty<'tcx> {
+        self.split().ty.expect_ty()
     }
 }
 
@@ -845,8 +904,11 @@ impl<'tcx> TraitRef<'tcx> {
 
     /// Returns a `TraitRef` of the form `P0: Foo<P1..Pn>` where `Pi`
     /// are the parameters defined on trait.
-    pub fn identity(tcx: TyCtxt<'tcx>, def_id: DefId) -> TraitRef<'tcx> {
-        TraitRef { def_id, substs: InternalSubsts::identity_for_item(tcx, def_id) }
+    pub fn identity(tcx: TyCtxt<'tcx>, def_id: DefId) -> Binder<'tcx, TraitRef<'tcx>> {
+        ty::Binder::dummy(TraitRef {
+            def_id,
+            substs: InternalSubsts::identity_for_item(tcx, def_id),
+        })
     }
 
     #[inline]
@@ -877,7 +939,11 @@ impl<'tcx> PolyTraitRef<'tcx> {
     }
 
     pub fn to_poly_trait_predicate(&self) -> ty::PolyTraitPredicate<'tcx> {
-        self.map_bound(|trait_ref| ty::TraitPredicate { trait_ref })
+        self.map_bound(|trait_ref| ty::TraitPredicate {
+            trait_ref,
+            constness: ty::BoundConstness::NotConst,
+            polarity: ty::ImplPolarity::Positive,
+        })
     }
 }
 
@@ -966,15 +1032,8 @@ where
     /// binder. This is commonly used to 'inject' a value T into a
     /// different binding level.
     pub fn dummy(value: T) -> Binder<'tcx, T> {
-        debug_assert!(!value.has_escaping_bound_vars());
+        assert!(!value.has_escaping_bound_vars());
         Binder(value, ty::List::empty())
-    }
-
-    /// Wraps `value` in a binder, binding higher-ranked vars (if any).
-    pub fn bind(value: T, tcx: TyCtxt<'tcx>) -> Binder<'tcx, T> {
-        let mut collector = BoundVarsCollector::new();
-        value.visit_with(&mut collector);
-        Binder(value, collector.into_vars(tcx))
     }
 
     pub fn bind_with_vars(value: T, vars: &'tcx List<BoundVariableKind>) -> Binder<'tcx, T> {
@@ -1273,7 +1332,7 @@ pub type Region<'tcx> = &'tcx RegionKind;
 /// Representation of regions. Note that the NLL checker uses a distinct
 /// representation of regions. For this reason, it internally replaces all the
 /// regions with inference variables -- the index of the variable is then used
-/// to index into internal NLL data structures. See `rustc_mir::borrow_check`
+/// to index into internal NLL data structures. See `rustc_const_eval::borrow_check`
 /// module for more information.
 ///
 /// ## The Region lattice within a given function
@@ -1328,7 +1387,7 @@ pub type Region<'tcx> = &'tcx RegionKind;
 /// These are regions that are stored behind a binder and must be substituted
 /// with some concrete region before being used. There are two kind of
 /// bound regions: early-bound, which are bound in an item's `Generics`,
-/// and are substituted by a `InternalSubsts`, and late-bound, which are part of
+/// and are substituted by an `InternalSubsts`, and late-bound, which are part of
 /// higher-ranked types (e.g., `for<'a> fn(&'a ())`), and are substituted by
 /// the likes of `liberate_late_bound_regions`. The distinction exists
 /// because higher-ranked lifetimes aren't supported in all places. See [1][2].
@@ -1370,8 +1429,8 @@ pub type Region<'tcx> = &'tcx RegionKind;
 /// happen, you can use `leak_check`. This is more clearly explained
 /// by the [rustc dev guide].
 ///
-/// [1]: http://smallcultfollowing.com/babysteps/blog/2013/10/29/intermingled-parameter-lists/
-/// [2]: http://smallcultfollowing.com/babysteps/blog/2013/11/04/intermingled-parameter-lists/
+/// [1]: https://smallcultfollowing.com/babysteps/blog/2013/10/29/intermingled-parameter-lists/
+/// [2]: https://smallcultfollowing.com/babysteps/blog/2013/11/04/intermingled-parameter-lists/
 /// [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/hrtb.html
 #[derive(Clone, PartialEq, Eq, Hash, Copy, TyEncodable, TyDecodable, PartialOrd, Ord)]
 pub enum RegionKind {
@@ -1476,7 +1535,7 @@ pub type PolyExistentialProjection<'tcx> = Binder<'tcx, ExistentialProjection<'t
 impl<'tcx> ExistentialProjection<'tcx> {
     /// Extracts the underlying existential trait reference from this projection.
     /// For example, if this is a projection of `exists T. <T as Iterator>::Item == X`,
-    /// then this function would return a `exists T. T: Iterator` existential trait
+    /// then this function would return an `exists T. T: Iterator` existential trait
     /// reference.
     pub fn trait_ref(&self, tcx: TyCtxt<'tcx>) -> ty::ExistentialTraitRef<'tcx> {
         let def_id = tcx.associated_item(self.item_def_id).container.id();
@@ -1570,26 +1629,26 @@ impl RegionKind {
 
         match *self {
             ty::ReVar(..) => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
                 flags = flags | TypeFlags::HAS_RE_INFER;
             }
             ty::RePlaceholder(..) => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
                 flags = flags | TypeFlags::HAS_RE_PLACEHOLDER;
             }
             ty::ReEarlyBound(..) => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
-                flags = flags | TypeFlags::HAS_RE_PARAM;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_RE_PARAM;
             }
             ty::ReFree { .. } => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
             }
             ty::ReEmpty(_) | ty::ReStatic => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
             }
             ty::ReLateBound(..) => {
                 flags = flags | TypeFlags::HAS_RE_LATE_BOUND;
@@ -1675,6 +1734,14 @@ impl<'tcx> TyS<'tcx> {
     #[inline]
     pub fn is_ty_var(&self) -> bool {
         matches!(self.kind(), Infer(TyVar(_)))
+    }
+
+    #[inline]
+    pub fn ty_vid(&self) -> Option<ty::TyVid> {
+        match self.kind() {
+            &Infer(TyVar(vid)) => Some(vid),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -2000,7 +2067,9 @@ impl<'tcx> TyS<'tcx> {
     ) -> Option<Discr<'tcx>> {
         match self.kind() {
             TyKind::Adt(adt, _) if adt.variants.is_empty() => {
-                bug!("discriminant_for_variant called on zero variant enum");
+                // This can actually happen during CTFE, see
+                // https://github.com/rust-lang/rust/issues/89765.
+                None
             }
             TyKind::Adt(adt, _) if adt.is_enum() => {
                 Some(adt.discriminant_for_variant(tcx, variant_index))
@@ -2019,10 +2088,10 @@ impl<'tcx> TyS<'tcx> {
             ty::Generator(_, substs, _) => substs.as_generator().discr_ty(tcx),
 
             ty::Param(_) | ty::Projection(_) | ty::Opaque(..) | ty::Infer(ty::TyVar(_)) => {
-                let assoc_items =
-                    tcx.associated_items(tcx.lang_items().discriminant_kind_trait().unwrap());
-                let discriminant_def_id = assoc_items.in_definition_order().next().unwrap().def_id;
-                tcx.mk_projection(discriminant_def_id, tcx.mk_substs([self.into()].iter()))
+                let assoc_items = tcx.associated_item_def_ids(
+                    tcx.require_lang_item(hir::LangItem::DiscriminantKind, None),
+                );
+                tcx.mk_projection(assoc_items[0], tcx.intern_substs(&[self.into()]))
             }
 
             ty::Bool
@@ -2189,7 +2258,7 @@ impl<'tcx> TyS<'tcx> {
 /// a miscompilation or unsoundness.
 ///
 /// When in doubt, use `VarianceDiagInfo::default()`
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VarianceDiagInfo<'tcx> {
     /// No additional information - this is the default.
     /// We will not add any additional information to error messages.
@@ -2208,7 +2277,7 @@ pub enum VarianceDiagInfo<'tcx> {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VarianceDiagMutKind {
     /// A mutable raw pointer (`*mut T`)
     RawPtr,

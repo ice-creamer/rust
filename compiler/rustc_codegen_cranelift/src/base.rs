@@ -3,8 +3,7 @@
 use cranelift_codegen::binemit::{NullStackMapSink, NullTrapSink};
 use rustc_index::vec::IndexVec;
 use rustc_middle::ty::adjustment::PointerCast;
-use rustc_middle::ty::layout::FnAbiExt;
-use rustc_target::abi::call::FnAbi;
+use rustc_middle::ty::layout::FnAbiOf;
 
 use crate::constant::ConstantCx;
 use crate::prelude::*;
@@ -21,6 +20,11 @@ pub(crate) fn codegen_fn<'tcx>(
     debug_assert!(!instance.substs.needs_infer());
 
     let mir = tcx.instance_mir(instance.def);
+    let _mir_guard = crate::PrintOnPanic(|| {
+        let mut buf = Vec::new();
+        rustc_middle::mir::write_mir_pretty(tcx, Some(instance.def_id()), &mut buf).unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    });
 
     // Declare function
     let symbol_name = tcx.symbol_name(instance);
@@ -52,13 +56,12 @@ pub(crate) fn codegen_fn<'tcx>(
         module,
         tcx,
         pointer_type,
-        vtables: FxHashMap::default(),
         constants_cx: ConstantCx::new(),
 
         instance,
         symbol_name,
         mir,
-        fn_abi: Some(FnAbi::of_instance(&RevealAllLayoutCx(tcx), instance, &[])),
+        fn_abi: Some(RevealAllLayoutCx(tcx).fn_abi_of_instance(instance, ty::List::empty())),
 
         bcx,
         block_map,
@@ -105,7 +108,14 @@ pub(crate) fn codegen_fn<'tcx>(
     let context = &mut cx.cached_context;
     context.func = func;
 
-    crate::pretty_clif::write_clif_file(tcx, "unopt", None, instance, &context, &clif_comments);
+    crate::pretty_clif::write_clif_file(
+        tcx,
+        "unopt",
+        module.isa(),
+        instance,
+        &context,
+        &clif_comments,
+    );
 
     // Verify function
     verify_func(tcx, &clif_comments, &context.func);
@@ -122,7 +132,13 @@ pub(crate) fn codegen_fn<'tcx>(
 
     // Perform rust specific optimizations
     tcx.sess.time("optimize clif ir", || {
-        crate::optimize::optimize_function(tcx, instance, context, &mut clif_comments);
+        crate::optimize::optimize_function(
+            tcx,
+            module.isa(),
+            instance,
+            context,
+            &mut clif_comments,
+        );
     });
 
     // Define function
@@ -137,7 +153,7 @@ pub(crate) fn codegen_fn<'tcx>(
     crate::pretty_clif::write_clif_file(
         tcx,
         "opt",
-        Some(module.isa()),
+        module.isa(),
         instance,
         &context,
         &clif_comments,
@@ -317,8 +333,6 @@ fn codegen_fn_content(fx: &mut FunctionCx<'_, '_, '_>) {
                         crate::optimize::peephole::maybe_unwrap_bool_not(&mut fx.bcx, discr);
                     let test_zero = if is_inverted { !test_zero } else { test_zero };
                     let discr = crate::optimize::peephole::maybe_unwrap_bint(&mut fx.bcx, discr);
-                    let discr =
-                        crate::optimize::peephole::make_branchable_value(&mut fx.bcx, discr);
                     if let Some(taken) = crate::optimize::peephole::maybe_known_branch_taken(
                         &fx.bcx, discr, test_zero,
                     ) {
@@ -687,6 +701,13 @@ fn codegen_stmt<'tcx>(
                     let len = codegen_array_len(fx, place);
                     lval.write_cvalue(fx, CValue::by_val(len, usize_layout));
                 }
+                Rvalue::ShallowInitBox(ref operand, content_ty) => {
+                    let content_ty = fx.monomorphize(content_ty);
+                    let box_layout = fx.layout_of(fx.tcx.mk_box(content_ty));
+                    let operand = codegen_operand(fx, operand);
+                    let operand = operand.load_scalar(fx);
+                    lval.write_cvalue(fx, CValue::by_val(operand, box_layout));
+                }
                 Rvalue::NullaryOp(NullOp::Box, content_ty) => {
                     let usize_type = fx.clif_type(fx.tcx.types.usize).unwrap();
                     let content_ty = fx.monomorphize(content_ty);
@@ -711,15 +732,20 @@ fn codegen_stmt<'tcx>(
                     let ptr = fx.bcx.inst_results(call)[0];
                     lval.write_cvalue(fx, CValue::by_val(ptr, box_layout));
                 }
-                Rvalue::NullaryOp(NullOp::SizeOf, ty) => {
+                Rvalue::NullaryOp(null_op, ty) => {
                     assert!(
                         lval.layout()
                             .ty
                             .is_sized(fx.tcx.at(stmt.source_info.span), ParamEnv::reveal_all())
                     );
-                    let ty_size = fx.layout_of(fx.monomorphize(ty)).size.bytes();
+                    let layout = fx.layout_of(fx.monomorphize(ty));
+                    let val = match null_op {
+                        NullOp::SizeOf => layout.size.bytes(),
+                        NullOp::AlignOf => layout.align.abi.bytes(),
+                        NullOp::Box => unreachable!(),
+                    };
                     let val =
-                        CValue::const_val(fx, fx.layout_of(fx.tcx.types.usize), ty_size.into());
+                        CValue::const_val(fx, fx.layout_of(fx.tcx.types.usize), val.into());
                     lval.write_cvalue(fx, val);
                 }
                 Rvalue::Aggregate(ref kind, ref operands) => match kind.as_ref() {

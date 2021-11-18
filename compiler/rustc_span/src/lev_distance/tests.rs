@@ -21,8 +21,8 @@ fn test_lev_distance() {
 
 #[test]
 fn test_find_best_match_for_name() {
-    use crate::with_default_session_globals;
-    with_default_session_globals(|| {
+    use crate::create_default_session_globals_then;
+    create_default_session_globals_then(|| {
         let input = vec![Symbol::intern("aaab"), Symbol::intern("aaabc")];
         assert_eq!(
             find_best_match_for_name(&input, Symbol::intern("aaaa"), None),
@@ -31,15 +31,11 @@ fn test_find_best_match_for_name() {
 
         assert_eq!(find_best_match_for_name(&input, Symbol::intern("1111111111"), None), None);
 
-        let input = vec![Symbol::intern("aAAA")];
-        assert_eq!(
-            find_best_match_for_name(&input, Symbol::intern("AAAA"), None),
-            Some(Symbol::intern("aAAA"))
-        );
-
         let input = vec![Symbol::intern("AAAA")];
-        // Returns None because `lev_distance > max_dist / 3`
-        assert_eq!(find_best_match_for_name(&input, Symbol::intern("aaaa"), None), None);
+        assert_eq!(
+            find_best_match_for_name(&input, Symbol::intern("aaaa"), None),
+            Some(Symbol::intern("AAAA"))
+        );
 
         let input = vec![Symbol::intern("AAAA")];
         assert_eq!(

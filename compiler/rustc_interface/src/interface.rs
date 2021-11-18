@@ -12,6 +12,7 @@ use rustc_errors::{ErrorReported, Handler};
 use rustc_lint::LintStore;
 use rustc_middle::ty;
 use rustc_parse::new_parser_from_source_str;
+use rustc_query_impl::QueryCtxt;
 use rustc_session::config::{self, ErrorOutputType, Input, OutputFilenames};
 use rustc_session::early_error;
 use rustc_session::lint;
@@ -35,9 +36,10 @@ pub struct Compiler {
     pub(crate) input_path: Option<PathBuf>,
     pub(crate) output_dir: Option<PathBuf>,
     pub(crate) output_file: Option<PathBuf>,
+    pub(crate) temps_dir: Option<PathBuf>,
     pub(crate) register_lints: Option<Box<dyn Fn(&Session, &mut LintStore) + Send + Sync>>,
     pub(crate) override_queries:
-        Option<fn(&Session, &mut ty::query::Providers, &mut ty::query::Providers)>,
+        Option<fn(&Session, &mut ty::query::Providers, &mut ty::query::ExternProviders)>,
 }
 
 impl Compiler {
@@ -56,6 +58,9 @@ impl Compiler {
     pub fn output_file(&self) -> &Option<PathBuf> {
         &self.output_file
     }
+    pub fn temps_dir(&self) -> &Option<PathBuf> {
+        &self.temps_dir
+    }
     pub fn register_lints(&self) -> &Option<Box<dyn Fn(&Session, &mut LintStore) + Send + Sync>> {
         &self.register_lints
     }
@@ -68,19 +73,23 @@ impl Compiler {
             &self.input,
             &self.output_dir,
             &self.output_file,
-            &attrs,
-            &sess,
+            &self.temps_dir,
+            attrs,
+            sess,
         )
     }
 }
 
 /// Converts strings provided as `--cfg [cfgspec]` into a `crate_cfg`.
 pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> FxHashSet<(String, Option<String>)> {
-    rustc_span::with_default_session_globals(move || {
+    rustc_span::create_default_session_if_not_set_then(move |_| {
         let cfg = cfgspecs
             .into_iter()
             .map(|s| {
-                let sess = ParseSess::with_silent_emitter();
+                let sess = ParseSess::with_silent_emitter(Some(format!(
+                    "this error occurred on the command line: `--cfg={}`",
+                    s
+                )));
                 let filename = FileName::cfg_spec_source_code(&s);
                 let mut parser = new_parser_from_source_str(&sess, filename, s.to_string());
 
@@ -157,7 +166,7 @@ pub struct Config {
     ///
     /// The second parameter is local providers and the third parameter is external providers.
     pub override_queries:
-        Option<fn(&Session, &mut ty::query::Providers, &mut ty::query::Providers)>,
+        Option<fn(&Session, &mut ty::query::Providers, &mut ty::query::ExternProviders)>,
 
     /// This is a callback from the driver that is called to create a codegen backend.
     pub make_codegen_backend:
@@ -188,6 +197,8 @@ pub fn create_compiler_and_run<R>(config: Config, f: impl FnOnce(&Compiler) -> R
         );
     }
 
+    let temps_dir = sess.opts.debugging_opts.temps_dir.as_ref().map(|o| PathBuf::from(&o));
+
     let compiler = Compiler {
         sess,
         codegen_backend,
@@ -195,6 +206,7 @@ pub fn create_compiler_and_run<R>(config: Config, f: impl FnOnce(&Compiler) -> R
         input_path: config.input_path,
         output_dir: config.output_dir,
         output_file: config.output_file,
+        temps_dir,
         register_lints: config.register_lints,
         override_queries: config.override_queries,
     };
@@ -233,7 +245,7 @@ pub fn try_print_query_stack(handler: &Handler, num_frames: Option<usize>) {
     // state if it was responsible for triggering the panic.
     let i = ty::tls::with_context_opt(|icx| {
         if let Some(icx) = icx {
-            icx.tcx.queries.try_print_query_stack(icx.tcx, icx.query, handler, num_frames)
+            QueryCtxt::from_tcx(icx.tcx).try_print_query_stack(icx.query, handler, num_frames)
         } else {
             0
         }

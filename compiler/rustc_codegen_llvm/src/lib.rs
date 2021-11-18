@@ -8,7 +8,6 @@
 #![feature(bool_to_option)]
 #![feature(const_cstr_unchecked)]
 #![feature(crate_visibility_modifier)]
-#![cfg_attr(bootstrap, feature(extended_key_value_attributes))]
 #![feature(extern_types)]
 #![feature(in_band_lifetimes)]
 #![feature(iter_zip)]
@@ -28,8 +27,8 @@ use rustc_codegen_ssa::ModuleCodegen;
 use rustc_codegen_ssa::{CodegenResults, CompiledModule};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{ErrorReported, FatalError, Handler};
+use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
-use rustc_middle::middle::cstore::EncodedMetadata;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{OptLevel, OutputFilenames, PrintRequest};
 use rustc_session::Session;
@@ -77,6 +76,27 @@ mod value;
 #[derive(Clone)]
 pub struct LlvmCodegenBackend(());
 
+struct TimeTraceProfiler {
+    enabled: bool,
+}
+
+impl TimeTraceProfiler {
+    fn new(enabled: bool) -> Self {
+        if enabled {
+            unsafe { llvm::LLVMTimeTraceProfilerInitialize() }
+        }
+        TimeTraceProfiler { enabled }
+    }
+}
+
+impl Drop for TimeTraceProfiler {
+    fn drop(&mut self) {
+        if self.enabled {
+            unsafe { llvm::LLVMTimeTraceProfilerFinishThread() }
+        }
+    }
+}
+
 impl ExtraBackendMethods for LlvmCodegenBackend {
     fn new_metadata(&self, tcx: TyCtxt<'_>, mod_name: &str) -> ModuleLlvm {
         ModuleLlvm::new_metadata(tcx, mod_name)
@@ -93,11 +113,12 @@ impl ExtraBackendMethods for LlvmCodegenBackend {
     fn codegen_allocator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
-        mods: &mut ModuleLlvm,
+        module_llvm: &mut ModuleLlvm,
+        module_name: &str,
         kind: AllocatorKind,
         has_alloc_error_handler: bool,
     ) {
-        unsafe { allocator::codegen(tcx, mods, kind, has_alloc_error_handler) }
+        unsafe { allocator::codegen(tcx, module_llvm, module_name, kind, has_alloc_error_handler) }
     }
     fn compile_codegen_unit(
         &self,
@@ -118,6 +139,34 @@ impl ExtraBackendMethods for LlvmCodegenBackend {
     }
     fn tune_cpu<'b>(&self, sess: &'b Session) -> Option<&'b str> {
         llvm_util::tune_cpu(sess)
+    }
+
+    fn spawn_thread<F, T>(time_trace: bool, f: F) -> std::thread::JoinHandle<T>
+    where
+        F: FnOnce() -> T,
+        F: Send + 'static,
+        T: Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let _profiler = TimeTraceProfiler::new(time_trace);
+            f()
+        })
+    }
+
+    fn spawn_named_thread<F, T>(
+        time_trace: bool,
+        name: String,
+        f: F,
+    ) -> std::io::Result<std::thread::JoinHandle<T>>
+    where
+        F: FnOnce() -> T,
+        F: Send + 'static,
+        T: Send + 'static,
+    {
+        std::thread::Builder::new().name(name).spawn(move || {
+            let _profiler = TimeTraceProfiler::new(time_trace);
+            f()
+        })
     }
 }
 
@@ -211,9 +260,16 @@ impl CodegenBackend for LlvmCodegenBackend {
         match req {
             PrintRequest::RelocationModels => {
                 println!("Available relocation models:");
-                for name in
-                    &["static", "pic", "dynamic-no-pic", "ropi", "rwpi", "ropi-rwpi", "default"]
-                {
+                for name in &[
+                    "static",
+                    "pic",
+                    "pie",
+                    "dynamic-no-pic",
+                    "ropi",
+                    "rwpi",
+                    "ropi-rwpi",
+                    "default",
+                ] {
                     println!("    {}", name);
                 }
                 println!();
@@ -293,14 +349,7 @@ impl CodegenBackend for LlvmCodegenBackend {
 
         // Run the linker on any artifacts that resulted from the LLVM run.
         // This should produce either a finished executable or library.
-        link_binary::<LlvmArchiveBuilder<'_>>(
-            sess,
-            &codegen_results,
-            outputs,
-            &codegen_results.crate_info.local_crate_name.as_str(),
-        );
-
-        Ok(())
+        link_binary::<LlvmArchiveBuilder<'_>>(sess, &codegen_results, outputs)
     }
 }
 
@@ -339,7 +388,7 @@ impl ModuleLlvm {
         unsafe {
             let llcx = llvm::LLVMRustContextCreate(cgcx.fewer_names);
             let llmod_raw = back::lto::parse_module(llcx, name, buffer, handler)?;
-            let tm_factory_config = TargetMachineFactoryConfig::new(&cgcx, name.to_str().unwrap());
+            let tm_factory_config = TargetMachineFactoryConfig::new(cgcx, name.to_str().unwrap());
             let tm = match (cgcx.tm_factory)(tm_factory_config) {
                 Ok(m) => m,
                 Err(e) => {
@@ -360,8 +409,8 @@ impl ModuleLlvm {
 impl Drop for ModuleLlvm {
     fn drop(&mut self) {
         unsafe {
-            llvm::LLVMContextDispose(&mut *(self.llcx as *mut _));
             llvm::LLVMRustDisposeTargetMachine(&mut *(self.tm as *mut _));
+            llvm::LLVMContextDispose(&mut *(self.llcx as *mut _));
         }
     }
 }

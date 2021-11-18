@@ -3,6 +3,7 @@
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/method-lookup.html
 
 mod confirm;
+mod prelude2021;
 pub mod probe;
 mod suggest;
 
@@ -20,7 +21,7 @@ use rustc_infer::infer::{self, InferOk};
 use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::subst::{InternalSubsts, SubstsRef};
 use rustc_middle::ty::GenericParamDefKind;
-use rustc_middle::ty::{self, ToPolyTraitRef, ToPredicate, Ty, TypeFoldable, WithConstness};
+use rustc_middle::ty::{self, ToPredicate, Ty, TypeFoldable, WithConstness};
 use rustc_span::symbol::Ident;
 use rustc_span::Span;
 use rustc_trait_selection::traits;
@@ -140,6 +141,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         method_name: Ident,
         self_ty: Ty<'tcx>,
         call_expr: &hir::Expr<'_>,
+        span: Option<Span>,
     ) {
         let params = self
             .probe_for_name(
@@ -158,7 +160,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .unwrap_or(0);
 
         // Account for `foo.bar<T>`;
-        let sugg_span = call_expr.span.shrink_to_hi();
+        let sugg_span = span.unwrap_or(call_expr.span).shrink_to_hi();
         let (suggestion, applicability) = (
             format!("({})", (0..params).map(|_| "_").collect::<Vec<_>>().join(", ")),
             if params > 0 { Applicability::HasPlaceholders } else { Applicability::MaybeIncorrect },
@@ -173,7 +175,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ///
     /// # Arguments
     ///
-    /// Given a method call like `foo.bar::<T1,...Tn>(...)`:
+    /// Given a method call like `foo.bar::<T1,...Tn>(a, b + 1, ...)`:
     ///
     /// * `self`:                  the surrounding `FnCtxt` (!)
     /// * `self_ty`:               the (unadjusted) type of the self expression (`foo`)
@@ -181,6 +183,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// * `span`:                  the span for the method call
     /// * `call_expr`:             the complete method call: (`foo.bar::<T1,...Tn>(...)`)
     /// * `self_expr`:             the self expression (`foo`)
+    /// * `args`:                  the expressions of the arguments (`a, b + 1, ...`)
     #[instrument(level = "debug", skip(self, call_expr, self_expr))]
     pub fn lookup_method(
         &self,
@@ -189,6 +192,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         span: Span,
         call_expr: &'tcx hir::Expr<'tcx>,
         self_expr: &'tcx hir::Expr<'tcx>,
+        args: &'tcx [hir::Expr<'tcx>],
     ) -> Result<MethodCallee<'tcx>, MethodError<'tcx>> {
         debug!(
             "lookup(method_name={}, self_ty={:?}, call_expr={:?}, self_expr={:?})",
@@ -197,6 +201,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let pick =
             self.lookup_probe(span, segment.ident, self_ty, call_expr, ProbeScope::TraitsInScope)?;
+
+        self.lint_dot_call_from_2018(self_ty, segment, span, call_expr, self_expr, &pick, args);
 
         for import_id in &pick.import_ids {
             debug!("used_trait_import: {:?}", import_id);
@@ -284,6 +290,44 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         )
     }
 
+    pub(super) fn obligation_for_method(
+        &self,
+        span: Span,
+        trait_def_id: DefId,
+        self_ty: Ty<'tcx>,
+        opt_input_types: Option<&[Ty<'tcx>]>,
+    ) -> (traits::Obligation<'tcx, ty::Predicate<'tcx>>, &'tcx ty::List<ty::subst::GenericArg<'tcx>>)
+    {
+        // Construct a trait-reference `self_ty : Trait<input_tys>`
+        let substs = InternalSubsts::for_item(self.tcx, trait_def_id, |param, _| {
+            match param.kind {
+                GenericParamDefKind::Lifetime | GenericParamDefKind::Const { .. } => {}
+                GenericParamDefKind::Type { .. } => {
+                    if param.index == 0 {
+                        return self_ty.into();
+                    } else if let Some(input_types) = opt_input_types {
+                        return input_types[param.index as usize - 1].into();
+                    }
+                }
+            }
+            self.var_for_def(span, param)
+        });
+
+        let trait_ref = ty::TraitRef::new(trait_def_id, substs);
+
+        // Construct an obligation
+        let poly_trait_ref = ty::Binder::dummy(trait_ref);
+        (
+            traits::Obligation::misc(
+                span,
+                self.body_id,
+                self.param_env,
+                poly_trait_ref.without_const().to_predicate(self.tcx),
+            ),
+            substs,
+        )
+    }
+
     /// `lookup_method_in_trait` is used for overloaded operators.
     /// It does a very narrow slice of what the normal probe/confirm path does.
     /// In particular, it doesn't really do any probing: it simply constructs
@@ -294,7 +338,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     // code with the other method-lookup code. In particular, the second half
     // of this method is basically the same as confirmation.
     #[instrument(level = "debug", skip(self, span, opt_input_types))]
-    pub fn lookup_method_in_trait(
+    pub(super) fn lookup_method_in_trait(
         &self,
         span: Span,
         m_name: Ident,
@@ -307,36 +351,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self_ty, m_name, trait_def_id, opt_input_types
         );
 
-        // Construct a trait-reference `self_ty : Trait<input_tys>`
-        let substs = InternalSubsts::for_item(self.tcx, trait_def_id, |param, _| {
-            match param.kind {
-                GenericParamDefKind::Lifetime | GenericParamDefKind::Const { .. } => {}
-                GenericParamDefKind::Type { .. } => {
-                    if param.index == 0 {
-                        return self_ty.into();
-                    } else if let Some(ref input_types) = opt_input_types {
-                        return input_types[param.index as usize - 1].into();
-                    }
-                }
-            }
-            self.var_for_def(span, param)
-        });
-
-        let trait_ref = ty::TraitRef::new(trait_def_id, substs);
-
-        // Construct an obligation
-        let poly_trait_ref = trait_ref.to_poly_trait_ref();
-        let obligation = traits::Obligation::misc(
-            span,
-            self.body_id,
-            self.param_env,
-            poly_trait_ref.without_const().to_predicate(self.tcx),
-        );
+        let (obligation, substs) =
+            self.obligation_for_method(span, trait_def_id, self_ty, opt_input_types);
 
         // Now we want to know if this can be matched
         if !self.predicate_may_hold(&obligation) {
             debug!("--> Cannot match obligation");
-            return None; // Cannot be matched, no such method resolution is possible.
+            // Cannot be matched, no such method resolution is possible.
+            return None;
         }
 
         // Trait must have a method named `m_name` and it should not have
@@ -399,7 +421,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         obligations.extend(traits::predicates_for_generics(cause.clone(), self.param_env, bounds));
 
         // Also add an obligation for the method type being well-formed.
-        let method_ty = tcx.mk_fn_ptr(ty::Binder::bind(fn_sig, tcx));
+        let method_ty = tcx.mk_fn_ptr(ty::Binder::dummy(fn_sig));
         debug!(
             "lookup_in_trait_adjusted: matched method method_ty={:?} obligation={:?}",
             method_ty, obligation
@@ -407,26 +429,43 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         obligations.push(traits::Obligation::new(
             cause,
             self.param_env,
-            ty::PredicateKind::WellFormed(method_ty.into()).to_predicate(tcx),
+            ty::Binder::dummy(ty::PredicateKind::WellFormed(method_ty.into())).to_predicate(tcx),
         ));
 
-        let callee = MethodCallee { def_id, substs: trait_ref.substs, sig: fn_sig };
+        let callee = MethodCallee { def_id, substs, sig: fn_sig };
 
         debug!("callee = {:?}", callee);
 
         Some(InferOk { obligations, value: callee })
     }
 
+    /// Performs a [full-qualified function call] (formerly "universal function call") lookup. If
+    /// lookup is successful, it will return the type of definition and the [`DefId`] of the found
+    /// function definition.
+    ///
+    /// [full-qualified function call]: https://doc.rust-lang.org/reference/expressions/call-expr.html#disambiguating-function-calls
+    ///
+    /// # Arguments
+    ///
+    /// Given a function call like `Foo::bar::<T1,...Tn>(...)`:
+    ///
+    /// * `self`:                  the surrounding `FnCtxt` (!)
+    /// * `span`:                  the span of the call, excluding arguments (`Foo::bar::<T1, ...Tn>`)
+    /// * `method_name`:           the identifier of the function within the container type (`bar`)
+    /// * `self_ty`:               the type to search within (`Foo`)
+    /// * `self_ty_span`           the span for the type being searched within (span of `Foo`)
+    /// * `expr_id`:               the [`hir::HirId`] of the expression composing the entire call
     #[instrument(level = "debug", skip(self))]
-    pub fn resolve_ufcs(
+    pub fn resolve_fully_qualified_call(
         &self,
         span: Span,
         method_name: Ident,
         self_ty: Ty<'tcx>,
+        self_ty_span: Span,
         expr_id: hir::HirId,
     ) -> Result<(DefKind, DefId), MethodError<'tcx>> {
         debug!(
-            "resolve_ufcs: method_name={:?} self_ty={:?} expr_id={:?}",
+            "resolve_fully_qualified_call: method_name={:?} self_ty={:?} expr_id={:?}",
             method_name, self_ty, expr_id,
         );
 
@@ -463,18 +502,31 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             expr_id,
             ProbeScope::TraitsInScope,
         )?;
-        debug!("resolve_ufcs: pick={:?}", pick);
+
+        self.lint_fully_qualified_call_from_2018(
+            span,
+            method_name,
+            self_ty,
+            self_ty_span,
+            expr_id,
+            &pick,
+        );
+
+        debug!("resolve_fully_qualified_call: pick={:?}", pick);
         {
             let mut typeck_results = self.typeck_results.borrow_mut();
             let used_trait_imports = Lrc::get_mut(&mut typeck_results.used_trait_imports).unwrap();
             for import_id in pick.import_ids {
-                debug!("resolve_ufcs: used_trait_import: {:?}", import_id);
+                debug!("resolve_fully_qualified_call: used_trait_import: {:?}", import_id);
                 used_trait_imports.insert(import_id);
             }
         }
 
         let def_kind = pick.item.kind.as_def_kind();
-        debug!("resolve_ufcs: def_kind={:?}, def_id={:?}", def_kind, pick.item.def_id);
+        debug!(
+            "resolve_fully_qualified_call: def_kind={:?}, def_id={:?}",
+            def_kind, pick.item.def_id
+        );
         tcx.check_stability(pick.item.def_id, Some(expr_id), span, Some(method_name.span));
         Ok((def_kind, pick.item.def_id))
     }

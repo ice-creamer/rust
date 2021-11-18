@@ -1,5 +1,4 @@
 pub mod codegen_fn_attrs;
-pub mod cstore;
 pub mod dependency_format;
 pub mod exported_symbols;
 pub mod lang_items;
@@ -32,3 +31,7 @@ pub mod privacy;
 pub mod region;
 pub mod resolve_lifetime;
 pub mod stability;
+
+pub fn provide(providers: &mut crate::ty::query::Providers) {
+    limits::provide(providers);
+}

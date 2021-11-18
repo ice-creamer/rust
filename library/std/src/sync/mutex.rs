@@ -162,7 +162,7 @@ use crate::sys_common::mutex as sys;
 /// assert_eq!(*res_mutex.lock().unwrap(), 800);
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[cfg_attr(not(test), rustc_diagnostic_item = "mutex_type")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Mutex")]
 pub struct Mutex<T: ?Sized> {
     inner: sys::MovableMutex,
     poison: poison::Flag,
@@ -188,6 +188,12 @@ unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 /// [`lock`]: Mutex::lock
 /// [`try_lock`]: Mutex::try_lock
 #[must_use = "if unused the Mutex will immediately unlock"]
+#[cfg_attr(
+    not(bootstrap),
+    must_not_suspend = "holding a MutexGuard across suspend \
+                      points can cause deadlocks, delays, \
+                      and cause Futures to not implement `Send`"
+)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     lock: &'a Mutex<T>,
@@ -216,26 +222,6 @@ impl<T> Mutex<T> {
             poison: poison::Flag::new(),
             data: UnsafeCell::new(t),
         }
-    }
-
-    /// Immediately drops the guard, and consequently unlocks the mutex.
-    ///
-    /// This function is equivalent to calling [`drop`] on the guard but is more self-documenting.
-    /// Alternately, the guard will be automatically dropped when it goes out of scope.
-    ///
-    /// ```
-    /// #![feature(mutex_unlock)]
-    ///
-    /// use std::sync::Mutex;
-    /// let mutex = Mutex::new(0);
-    ///
-    /// let mut guard = mutex.lock().unwrap();
-    /// *guard += 20;
-    /// Mutex::unlock(guard);
-    /// ```
-    #[unstable(feature = "mutex_unlock", issue = "81872")]
-    pub fn unlock(guard: MutexGuard<'_, T>) {
-        drop(guard);
     }
 }
 
@@ -331,6 +317,26 @@ impl<T: ?Sized> Mutex<T> {
                 Err(TryLockError::WouldBlock)
             }
         }
+    }
+
+    /// Immediately drops the guard, and consequently unlocks the mutex.
+    ///
+    /// This function is equivalent to calling [`drop`] on the guard but is more self-documenting.
+    /// Alternately, the guard will be automatically dropped when it goes out of scope.
+    ///
+    /// ```
+    /// #![feature(mutex_unlock)]
+    ///
+    /// use std::sync::Mutex;
+    /// let mutex = Mutex::new(0);
+    ///
+    /// let mut guard = mutex.lock().unwrap();
+    /// *guard += 20;
+    /// Mutex::unlock(guard);
+    /// ```
+    #[unstable(feature = "mutex_unlock", issue = "81872")]
+    pub fn unlock(guard: MutexGuard<'_, T>) {
+        drop(guard);
     }
 
     /// Determines whether the mutex is poisoned.

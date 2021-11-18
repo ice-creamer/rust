@@ -19,6 +19,10 @@ use crate::os::unix::fs::symlink as symlink_junction;
 use crate::os::windows::fs::{symlink_dir, symlink_file};
 #[cfg(windows)]
 use crate::sys::fs::symlink_junction;
+#[cfg(target_os = "macos")]
+use crate::sys::weak::weak;
+#[cfg(target_os = "macos")]
+use libc::{c_char, c_int};
 
 macro_rules! check {
     ($e:expr) => {
@@ -77,6 +81,17 @@ pub fn got_symlink_permission(tmpdir: &TempDir) -> bool {
         Err(ref err) if err.raw_os_error() == Some(1314) => false,
         Ok(_) | Err(_) => true,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn able_to_not_follow_symlinks_while_hard_linking() -> bool {
+    weak!(fn linkat(c_int, *const c_char, c_int, *const c_char, c_int) -> c_int);
+    linkat.get().is_some()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn able_to_not_follow_symlinks_while_hard_linking() -> bool {
+    return true;
 }
 
 #[test]
@@ -809,7 +824,7 @@ fn symlink_noexist() {
     };
 
     // Use a relative path for testing. Symlinks get normalized by Windows,
-    // so we may not get the same path back for absolute paths
+    // so we might not get the same path back for absolute paths
     check!(symlink_file(&"foo", &tmpdir.join("bar")));
     assert_eq!(check!(fs::read_link(&tmpdir.join("bar"))).to_str().unwrap(), "foo");
 }
@@ -818,20 +833,11 @@ fn symlink_noexist() {
 fn read_link() {
     if cfg!(windows) {
         // directory symlink
-        assert_eq!(
-            check!(fs::read_link(r"C:\Users\All Users")).to_str().unwrap(),
-            r"C:\ProgramData"
-        );
+        assert_eq!(check!(fs::read_link(r"C:\Users\All Users")), Path::new(r"C:\ProgramData"));
         // junction
-        assert_eq!(
-            check!(fs::read_link(r"C:\Users\Default User")).to_str().unwrap(),
-            r"C:\Users\Default"
-        );
+        assert_eq!(check!(fs::read_link(r"C:\Users\Default User")), Path::new(r"C:\Users\Default"));
         // junction with special permissions
-        assert_eq!(
-            check!(fs::read_link(r"C:\Documents and Settings\")).to_str().unwrap(),
-            r"C:\Users"
-        );
+        assert_eq!(check!(fs::read_link(r"C:\Documents and Settings\")), Path::new(r"C:\Users"));
     }
     let tmpdir = tmpdir();
     let link = tmpdir.join("link");
@@ -1329,7 +1335,8 @@ fn metadata_access_times() {
         match (a.created(), b.created()) {
             (Ok(t1), Ok(t2)) => assert!(t1 <= t2),
             (Err(e1), Err(e2))
-                if e1.kind() == ErrorKind::Other && e2.kind() == ErrorKind::Other
+                if e1.kind() == ErrorKind::Uncategorized
+                    && e2.kind() == ErrorKind::Uncategorized
                     || e1.kind() == ErrorKind::Unsupported
                         && e2.kind() == ErrorKind::Unsupported => {}
             (a, b) => {
@@ -1346,6 +1353,9 @@ fn symlink_hard_link() {
     if !got_symlink_permission(&tmpdir) {
         return;
     };
+    if !able_to_not_follow_symlinks_while_hard_linking() {
+        return;
+    }
 
     // Create "file", a file.
     check!(fs::File::create(tmpdir.join("file")));
@@ -1391,4 +1401,33 @@ fn symlink_hard_link() {
 
     // "hard_link" should still appear as a symlink.
     assert!(check!(fs::symlink_metadata(tmpdir.join("hard_link"))).file_type().is_symlink());
+}
+
+/// Ensure `fs::create_dir` works on Windows with longer paths.
+#[test]
+#[cfg(windows)]
+fn create_dir_long_paths() {
+    use crate::{ffi::OsStr, iter, os::windows::ffi::OsStrExt};
+    const PATH_LEN: usize = 247;
+
+    let tmpdir = tmpdir();
+    let mut path = tmpdir.path().to_path_buf();
+    path.push("a");
+    let mut path = path.into_os_string();
+
+    let utf16_len = path.encode_wide().count();
+    if utf16_len >= PATH_LEN {
+        // Skip the test in the unlikely event the local user has a long temp directory path.
+        // This should not affect CI.
+        return;
+    }
+    // Increase the length of the path.
+    path.extend(iter::repeat(OsStr::new("a")).take(PATH_LEN - utf16_len));
+
+    // This should succeed.
+    fs::create_dir(&path).unwrap();
+
+    // This will fail if the path isn't converted to verbatim.
+    path.push("a");
+    fs::create_dir(&path).unwrap();
 }

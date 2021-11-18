@@ -2,7 +2,8 @@
 
 #[lang = "bool"]
 impl bool {
-    /// Returns `Some(t)` if the `bool` is `true`, or `None` otherwise.
+    /// Returns `Some(t)` if the `bool` is [`true`](../std/keyword.true.html),
+    /// or `None` otherwise.
     ///
     /// # Examples
     ///
@@ -12,13 +13,14 @@ impl bool {
     /// assert_eq!(false.then_some(0), None);
     /// assert_eq!(true.then_some(0), Some(0));
     /// ```
-    #[unstable(feature = "bool_to_option", issue = "64260")]
+    #[unstable(feature = "bool_to_option", issue = "80967")]
     #[inline]
     pub fn then_some<T>(self, t: T) -> Option<T> {
         if self { Some(t) } else { None }
     }
 
-    /// Returns `Some(f())` if the `bool` is `true`, or `None` otherwise.
+    /// Returns `Some(f())` if the `bool` is [`true`](../std/keyword.true.html),
+    /// or `None` otherwise.
     ///
     /// # Examples
     ///

@@ -25,6 +25,7 @@ use crate::html::render::StylePath;
 use crate::html::static_files;
 use crate::opts;
 use crate::passes::{self, Condition, DefaultPassOption};
+use crate::scrape_examples::{AllCallLocations, ScrapeExamplesOptions};
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -137,7 +138,7 @@ crate struct Options {
     crate manual_passes: Vec<String>,
     /// Whether to display warnings during doc generation or while gathering doctests. By default,
     /// all non-rustdoc-specific lints are allowed when generating docs.
-    crate display_warnings: bool,
+    crate display_doctest_warnings: bool,
     /// Whether to run the `calculate-doc-coverage` pass, which counts the number of public items
     /// with and without documentation.
     crate show_coverage: bool,
@@ -156,6 +157,12 @@ crate struct Options {
     crate run_check: bool,
     /// Whether doctests should emit unused externs
     crate json_unused_externs: bool,
+    /// Whether to skip capturing stdout and stderr of tests.
+    crate nocapture: bool,
+
+    /// Configuration for scraping examples from the current crate. If this option is Some(..) then
+    /// the compiler will scrape examples and not generate documentation.
+    crate scrape_examples_options: Option<ScrapeExamplesOptions>,
 }
 
 impl fmt::Debug for Options {
@@ -190,7 +197,7 @@ impl fmt::Debug for Options {
             .field("persist_doctests", &self.persist_doctests)
             .field("default_passes", &self.default_passes)
             .field("manual_passes", &self.manual_passes)
-            .field("display_warnings", &self.display_warnings)
+            .field("display_doctest_warnings", &self.display_doctest_warnings)
             .field("show_coverage", &self.show_coverage)
             .field("crate_version", &self.crate_version)
             .field("render_options", &self.render_options)
@@ -199,6 +206,8 @@ impl fmt::Debug for Options {
             .field("enable-per-target-ignores", &self.enable_per_target_ignores)
             .field("run_check", &self.run_check)
             .field("no_run", &self.no_run)
+            .field("nocapture", &self.nocapture)
+            .field("scrape_examples_options", &self.scrape_examples_options)
             .finish()
     }
 }
@@ -230,6 +239,8 @@ crate struct RenderOptions {
     crate extension_css: Option<PathBuf>,
     /// A map of crate names to the URL to use instead of querying the crate's `html_root_url`.
     crate extern_html_root_urls: BTreeMap<String, String>,
+    /// Whether to give precedence to `html_root_url` or `--exten-html-root-url`.
+    crate extern_html_root_takes_precedence: bool,
     /// A map of the default settings (values are as for DOM storage API). Keys should lack the
     /// `rustdoc-` prefix.
     crate default_settings: FxHashMap<String, String>,
@@ -273,6 +284,9 @@ crate struct RenderOptions {
     crate show_type_layout: bool,
     crate unstable_features: rustc_feature::UnstableFeatures,
     crate emit: Vec<EmitType>,
+    /// If `true`, HTML source pages will generate links for items to their definition.
+    crate generate_link_to_definition: bool,
+    crate call_locations: AllCallLocations,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -307,13 +321,13 @@ impl Options {
     /// been printed, returns `Err` with the exit code.
     crate fn from_matches(matches: &getopts::Matches) -> Result<Options, i32> {
         // Check for unstable options.
-        nightly_options::check_nightly_options(&matches, &opts());
+        nightly_options::check_nightly_options(matches, &opts());
 
         if matches.opt_present("h") || matches.opt_present("help") {
             crate::usage("rustdoc");
             return Err(0);
         } else if matches.opt_present("version") {
-            rustc_driver::version("rustdoc", &matches);
+            rustc_driver::version("rustdoc", matches);
             return Err(0);
         }
 
@@ -349,10 +363,10 @@ impl Options {
             return Err(0);
         }
 
-        let color = config::parse_color(&matches);
+        let color = config::parse_color(matches);
         let config::JsonConfig { json_rendered, json_unused_externs, .. } =
-            config::parse_json(&matches);
-        let error_format = config::parse_error_format(&matches, color, json_rendered);
+            config::parse_json(matches);
+        let error_format = config::parse_error_format(matches, color, json_rendered);
 
         let codegen_options = CodegenOptions::build(matches, error_format);
         let debugging_opts = DebuggingOptions::build(matches, error_format);
@@ -360,7 +374,7 @@ impl Options {
         let diag = new_handler(error_format, None, &debugging_opts);
 
         // check for deprecated options
-        check_deprecated_options(&matches, &diag);
+        check_deprecated_options(matches, &diag);
 
         let mut emit = Vec::new();
         for list in matches.opt_strs("emit") {
@@ -426,8 +440,8 @@ impl Options {
             .iter()
             .map(|s| SearchPath::from_cli_opt(s, error_format))
             .collect();
-        let externs = parse_externs(&matches, &debugging_opts, error_format);
-        let extern_html_root_urls = match parse_extern_html_roots(&matches) {
+        let externs = parse_externs(matches, &debugging_opts, error_format);
+        let extern_html_root_urls = match parse_extern_html_roots(matches) {
             Ok(ex) => ex,
             Err(err) => {
                 diag.struct_err(err).emit();
@@ -456,7 +470,31 @@ impl Options {
                 })
                 .collect(),
         ];
-        let default_settings = default_settings.into_iter().flatten().collect();
+        let default_settings = default_settings
+            .into_iter()
+            .flatten()
+            .map(
+                // The keys here become part of `data-` attribute names in the generated HTML.  The
+                // browser does a strange mapping when converting them into attributes on the
+                // `dataset` property on the DOM HTML Node:
+                //   https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement/dataset
+                //
+                // The original key values we have are the same as the DOM storage API keys and the
+                // command line options, so contain `-`.  Our Javascript needs to be able to look
+                // these values up both in `dataset` and in the storage API, so it needs to be able
+                // to convert the names back and forth.  Despite doing this kebab-case to
+                // StudlyCaps transformation automatically, the JS DOM API does not provide a
+                // mechanism for doing the just transformation on a string.  So we want to avoid
+                // the StudlyCaps representation in the `dataset` property.
+                //
+                // We solve this by replacing all the `-`s with `_`s.  We do that here, when we
+                // generate the `data-` attributes, and in the JS, when we look them up.  (See
+                // `getSettingValue` in `storage.js.`) Converting `-` to `_` is simple in JS.
+                //
+                // The values will be HTML-escaped by the default Tera escaping.
+                |(k, v)| (k.replace('-', "_"), v),
+            )
+            .collect();
 
         let test_args = matches.opt_strs("test-args");
         let test_args: Vec<String> =
@@ -513,7 +551,7 @@ impl Options {
                     ))
                     .warn("the theme may appear incorrect when loaded")
                     .help(&format!(
-                        "to see what rules are missing, call `rustdoc  --check-theme \"{}\"`",
+                        "to see what rules are missing, call `rustdoc --check-theme \"{}\"`",
                         theme_s
                     ))
                     .emit();
@@ -522,7 +560,7 @@ impl Options {
             }
         }
 
-        let edition = config::parse_crate_edition(&matches);
+        let edition = config::parse_crate_edition(matches);
 
         let mut id_map = html::markdown::IdMap::new();
         let external_html = match ExternalHtml::load(
@@ -531,7 +569,7 @@ impl Options {
             &matches.opt_strs("html-after-content"),
             &matches.opt_strs("markdown-before-content"),
             &matches.opt_strs("markdown-after-content"),
-            nightly_options::match_is_nightly_build(&matches),
+            nightly_options::match_is_nightly_build(matches),
             &diag,
             &mut id_map,
             edition,
@@ -601,7 +639,7 @@ impl Options {
         let proc_macro_crate = crate_types.contains(&CrateType::ProcMacro);
         let playground_url = matches.opt_str("playground-url");
         let maybe_sysroot = matches.opt_str("sysroot").map(PathBuf::from);
-        let display_warnings = matches.opt_present("display-warnings");
+        let display_doctest_warnings = matches.opt_present("display-doctest-warnings");
         let sort_modules_alphabetically = !matches.opt_present("sort-modules-by-appearance");
         let resource_suffix = matches.opt_str("resource-suffix").unwrap_or_default();
         let enable_minification = !matches.opt_present("disable-minification");
@@ -627,9 +665,24 @@ impl Options {
         let run_check = matches.opt_present("check");
         let generate_redirect_map = matches.opt_present("generate-redirect-map");
         let show_type_layout = matches.opt_present("show-type-layout");
+        let nocapture = matches.opt_present("nocapture");
+        let generate_link_to_definition = matches.opt_present("generate-link-to-definition");
+        let extern_html_root_takes_precedence =
+            matches.opt_present("extern-html-root-takes-precedence");
 
-        let (lint_opts, describe_lints, lint_cap, _) =
-            get_cmd_lint_options(matches, error_format, &debugging_opts);
+        if generate_link_to_definition && (show_coverage || output_format != OutputFormat::Html) {
+            diag.struct_err(
+                "--generate-link-to-definition option can only be used with HTML output format",
+            )
+            .emit();
+            return Err(1);
+        }
+
+        let scrape_examples_options = ScrapeExamplesOptions::new(&matches, &diag)?;
+        let with_examples = matches.opt_strs("with-examples");
+        let call_locations = crate::scrape_examples::load_call_locations(with_examples, &diag)?;
+
+        let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(matches, error_format);
 
         Ok(Options {
             input,
@@ -654,7 +707,7 @@ impl Options {
             test_args,
             default_passes,
             manual_passes,
-            display_warnings,
+            display_doctest_warnings,
             show_coverage,
             crate_version,
             test_run_directory,
@@ -665,6 +718,7 @@ impl Options {
             test_builder,
             run_check,
             no_run,
+            nocapture,
             render_options: RenderOptions {
                 output,
                 external_html,
@@ -674,6 +728,7 @@ impl Options {
                 themes,
                 extension_css,
                 extern_html_root_urls,
+                extern_html_root_takes_precedence,
                 default_settings,
                 resource_suffix,
                 enable_minification,
@@ -692,10 +747,13 @@ impl Options {
                     crate_name.as_deref(),
                 ),
                 emit,
+                generate_link_to_definition,
+                call_locations,
             },
             crate_name,
             output_format,
             json_unused_externs,
+            scrape_examples_options,
         })
     }
 

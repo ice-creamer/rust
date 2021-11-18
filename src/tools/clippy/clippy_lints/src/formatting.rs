@@ -9,33 +9,33 @@ use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::source_map::Span;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for use of the non-existent `=*`, `=!` and `=-`
+    /// ### What it does
+    /// Checks for use of the non-existent `=*`, `=!` and `=-`
     /// operators.
     ///
-    /// **Why is this bad?** This is either a typo of `*=`, `!=` or `-=` or
+    /// ### Why is this bad?
+    /// This is either a typo of `*=`, `!=` or `-=` or
     /// confusing.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust,ignore
     /// a =- 42; // confusing, should it be `a -= 42` or `a = -42`?
     /// ```
     pub SUSPICIOUS_ASSIGNMENT_FORMATTING,
-    style,
+    suspicious,
     "suspicious formatting of `*=`, `-=` or `!=`"
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks the formatting of a unary operator on the right hand side
+    /// ### What it does
+    /// Checks the formatting of a unary operator on the right hand side
     /// of a binary operator. It lints if there is no space between the binary and unary operators,
     /// but there is a space between the unary and its operand.
     ///
-    /// **Why is this bad?** This is either a typo in the binary operator or confusing.
+    /// ### Why is this bad?
+    /// This is either a typo in the binary operator or confusing.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust,ignore
     /// if foo <- 30 { // this should be `foo < -30` but looks like a different operator
     /// }
@@ -44,20 +44,20 @@ declare_clippy_lint! {
     /// }
     /// ```
     pub SUSPICIOUS_UNARY_OP_FORMATTING,
-    style,
+    suspicious,
     "suspicious formatting of unary `-` or `!` on the RHS of a BinOp"
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for formatting of `else`. It lints if the `else`
+    /// ### What it does
+    /// Checks for formatting of `else`. It lints if the `else`
     /// is followed immediately by a newline or the `else` seems to be missing.
     ///
-    /// **Why is this bad?** This is probably some refactoring remnant, even if the
+    /// ### Why is this bad?
+    /// This is probably some refactoring remnant, even if the
     /// code is correct, it might look confusing.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust,ignore
     /// if foo {
     /// } { // looks like an `else` is missing here
@@ -80,19 +80,19 @@ declare_clippy_lint! {
     /// }
     /// ```
     pub SUSPICIOUS_ELSE_FORMATTING,
-    style,
+    suspicious,
     "suspicious formatting of `else`"
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for possible missing comma in an array. It lints if
+    /// ### What it does
+    /// Checks for possible missing comma in an array. It lints if
     /// an array element is a binary operator expression and it lies on two lines.
     ///
-    /// **Why is this bad?** This could lead to unexpected results.
+    /// ### Why is this bad?
+    /// This could lead to unexpected results.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust,ignore
     /// let a = &[
     ///     -1, -2, -3 // <= no comma here
@@ -164,7 +164,7 @@ fn check_unop(cx: &EarlyContext<'_>, expr: &Expr) {
         if !differing_macro_contexts(lhs.span, rhs.span) && !lhs.span.from_expansion();
         // span between BinOp LHS and RHS
         let binop_span = lhs.span.between(rhs.span);
-        // if RHS is a UnOp
+        // if RHS is an UnOp
         if let ExprKind::Unary(op, ref un_rhs) = rhs.kind;
         // from UnOp operator to UnOp operand
         let unop_operand_span = rhs.span.until(un_rhs.span);
@@ -286,34 +286,39 @@ fn check_array(cx: &EarlyContext<'_>, expr: &Expr) {
 }
 
 fn check_missing_else(cx: &EarlyContext<'_>, first: &Expr, second: &Expr) {
-    if !differing_macro_contexts(first.span, second.span)
-        && !first.span.from_expansion()
-        && is_if(first)
-        && (is_block(second) || is_if(second))
-    {
-        // where the else would be
+    if_chain! {
+        if !differing_macro_contexts(first.span, second.span);
+        if !first.span.from_expansion();
+        if let ExprKind::If(cond_expr, ..) = &first.kind;
+        if is_block(second) || is_if(second);
+
+        // Proc-macros can give weird spans. Make sure this is actually an `if`.
+        if let Some(if_snip) = snippet_opt(cx, first.span.until(cond_expr.span));
+        if if_snip.starts_with("if");
+
+        // If there is a line break between the two expressions, don't lint.
+        // If there is a non-whitespace character, this span came from a proc-macro.
         let else_span = first.span.between(second.span);
+        if let Some(else_snippet) = snippet_opt(cx, else_span);
+        if !else_snippet.chars().any(|c| c == '\n' || !c.is_whitespace());
+        then {
+            let (looks_like, next_thing) = if is_if(second) {
+                ("an `else if`", "the second `if`")
+            } else {
+                ("an `else {..}`", "the next block")
+            };
 
-        if let Some(else_snippet) = snippet_opt(cx, else_span) {
-            if !else_snippet.contains('\n') {
-                let (looks_like, next_thing) = if is_if(second) {
-                    ("an `else if`", "the second `if`")
-                } else {
-                    ("an `else {..}`", "the next block")
-                };
-
-                span_lint_and_note(
-                    cx,
-                    SUSPICIOUS_ELSE_FORMATTING,
-                    else_span,
-                    &format!("this looks like {} but the `else` is missing", looks_like),
-                    None,
-                    &format!(
-                        "to remove this lint, add the missing `else` or add a new line before {}",
-                        next_thing,
-                    ),
-                );
-            }
+            span_lint_and_note(
+                cx,
+                SUSPICIOUS_ELSE_FORMATTING,
+                else_span,
+                &format!("this looks like {} but the `else` is missing", looks_like),
+                None,
+                &format!(
+                    "to remove this lint, add the missing `else` or add a new line before {}",
+                    next_thing,
+                ),
+            );
         }
     }
 }

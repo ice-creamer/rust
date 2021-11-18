@@ -5,8 +5,6 @@ use rustc_query_system::query::{QueryCache, QueryCacheStore};
 
 use std::any::type_name;
 use std::mem;
-#[cfg(debug_assertions)]
-use std::sync::atomic::Ordering;
 
 trait KeyStats {
     fn key_stats(&self, stats: &mut QueryStats);
@@ -27,7 +25,6 @@ impl KeyStats for DefId {
 #[derive(Clone)]
 struct QueryStats {
     name: &'static str,
-    cache_hits: usize,
     key_size: usize,
     key_type: &'static str,
     value_size: usize,
@@ -42,10 +39,6 @@ where
 {
     let mut stats = QueryStats {
         name,
-        #[cfg(debug_assertions)]
-        cache_hits: map.cache_hits.load(Ordering::Relaxed),
-        #[cfg(not(debug_assertions))]
-        cache_hits: 0,
         key_size: mem::size_of::<C::Key>(),
         key_type: type_name::<C::Key>(),
         value_size: mem::size_of::<C::Value>(),
@@ -63,12 +56,6 @@ where
 pub fn print_stats(tcx: TyCtxt<'_>) {
     let queries = query_stats(tcx);
 
-    if cfg!(debug_assertions) {
-        let hits: usize = queries.iter().map(|s| s.cache_hits).sum();
-        let results: usize = queries.iter().map(|s| s.entry_count).sum();
-        eprintln!("\nQuery cache hit rate: {}", hits as f64 / (hits + results) as f64);
-    }
-
     let mut query_key_sizes = queries.clone();
     query_key_sizes.sort_by_key(|q| q.key_size);
     eprintln!("\nLarge query keys:");
@@ -83,20 +70,6 @@ pub fn print_stats(tcx: TyCtxt<'_>) {
         eprintln!("   {} - {} x {} - {}", q.name, q.value_size, q.entry_count, q.value_type);
     }
 
-    if cfg!(debug_assertions) {
-        let mut query_cache_hits = queries.clone();
-        query_cache_hits.sort_by_key(|q| q.cache_hits);
-        eprintln!("\nQuery cache hits:");
-        for q in query_cache_hits.iter().rev() {
-            eprintln!(
-                "   {} - {} ({}%)",
-                q.name,
-                q.cache_hits,
-                q.cache_hits as f64 / (q.cache_hits + q.entry_count) as f64
-            );
-        }
-    }
-
     let mut query_value_count = queries.clone();
     query_value_count.sort_by_key(|q| q.entry_count);
     eprintln!("\nQuery value count:");
@@ -108,7 +81,7 @@ pub fn print_stats(tcx: TyCtxt<'_>) {
         queries.iter().filter(|q| q.local_def_id_keys.is_some()).collect();
     def_id_density.sort_by_key(|q| q.local_def_id_keys.unwrap());
     eprintln!("\nLocal DefId density:");
-    let total = tcx.hir().definitions().def_index_count() as f64;
+    let total = tcx.resolutions(()).definitions.def_index_count() as f64;
     for q in def_id_density.iter().rev() {
         let local = q.local_def_id_keys.unwrap();
         eprintln!("   {} - {} = ({}%)", q.name, local, (local as f64 * 100.0) / total);

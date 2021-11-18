@@ -35,6 +35,9 @@ LL | use method::B;
 error[E0624]: associated function `a` is private
   --> $DIR/item-privacy.rs:72:7
    |
+LL |         fn a(&self) { }
+   |         ----------- private associated function defined here
+...
 LL |     c.a();
    |       ^ private associated function
 
@@ -72,6 +75,9 @@ LL | use method::B;
 error[E0624]: associated function `a` is private
   --> $DIR/item-privacy.rs:84:14
    |
+LL |         fn a(&self) { }
+   |         ----------- private associated function defined here
+...
 LL |     <dyn C>::a(&S);
    |              ^ private associated function
 
@@ -109,6 +115,9 @@ LL | use assoc_const::B;
 error[E0624]: associated constant `A` is private
   --> $DIR/item-privacy.rs:101:14
    |
+LL |         const A: u8 = 0;
+   |         ---------------- private associated constant defined here
+...
 LL |     <dyn C>::A;
    |              ^ private associated constant
 
@@ -118,9 +127,6 @@ error[E0038]: the trait `assoc_const::C` cannot be made into an object
 LL |     <dyn C>::A;
    |      ^^^^^ `assoc_const::C` cannot be made into an object
    |
-   = help: consider moving `C` to another trait
-   = help: consider moving `B` to another trait
-   = help: consider moving `A` to another trait
 note: for a trait to be "object safe" it needs to allow building a vtable to allow the call to be resolvable dynamically; for more information visit <https://doc.rust-lang.org/reference/items/traits.html#object-safety>
   --> $DIR/item-privacy.rs:25:15
    |
@@ -134,6 +140,9 @@ LL |     pub trait C: A + B {
    |               - this trait cannot be made into an object...
 LL |         const C: u8 = 0;
    |               ^ ...because it contains this associated `const`
+   = help: consider moving `C` to another trait
+   = help: consider moving `A` to another trait
+   = help: consider moving `B` to another trait
 
 error[E0223]: ambiguous associated type
   --> $DIR/item-privacy.rs:115:12

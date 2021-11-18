@@ -9,9 +9,10 @@ use rustc_lint_defs::Applicability;
 use rustc_serialize::json::Json;
 use rustc_span::{MultiSpan, Span, DUMMY_SP};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 #[must_use]
-#[derive(Clone, Debug, PartialEq, Hash, Encodable, Decodable)]
+#[derive(Clone, Debug, Encodable, Decodable)]
 pub struct Diagnostic {
     pub level: Level,
     pub message: Vec<(String, Style)>,
@@ -24,12 +25,16 @@ pub struct Diagnostic {
     /// as a sort key to sort a buffer of diagnostics.  By default, it is the primary span of
     /// `span` if there is one.  Otherwise, it is `DUMMY_SP`.
     pub sort_span: Span,
+
+    /// If diagnostic is from Lint, custom hash function ignores notes
+    /// otherwise hash is based on the all the fields
+    pub is_lint: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
 pub enum DiagnosticId {
     Error(String),
-    Lint { name: String, has_future_breakage: bool },
+    Lint { name: String, has_future_breakage: bool, is_force_warn: bool },
 }
 
 /// A "sub"-diagnostic attached to a parent diagnostic.
@@ -69,12 +74,24 @@ impl DiagnosticStyledString {
     pub fn highlighted<S: Into<String>>(t: S) -> DiagnosticStyledString {
         DiagnosticStyledString(vec![StringPart::Highlighted(t.into())])
     }
+
+    pub fn content(&self) -> String {
+        self.0.iter().map(|x| x.content()).collect::<String>()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StringPart {
     Normal(String),
     Highlighted(String),
+}
+
+impl StringPart {
+    pub fn content(&self) -> &str {
+        match self {
+            &StringPart::Normal(ref s) | &StringPart::Highlighted(ref s) => s,
+        }
+    }
 }
 
 impl Diagnostic {
@@ -91,12 +108,13 @@ impl Diagnostic {
             children: vec![],
             suggestions: vec![],
             sort_span: DUMMY_SP,
+            is_lint: false,
         }
     }
 
     pub fn is_error(&self) -> bool {
         match self.level {
-            Level::Bug | Level::Fatal | Level::Error | Level::FailureNote => true,
+            Level::Bug | Level::Fatal | Level::Error { .. } | Level::FailureNote => true,
 
             Level::Warning | Level::Note | Level::Help | Level::Cancelled | Level::Allow => false,
         }
@@ -105,6 +123,13 @@ impl Diagnostic {
     pub fn has_future_breakage(&self) -> bool {
         match self.code {
             Some(DiagnosticId::Lint { has_future_breakage, .. }) => has_future_breakage,
+            _ => false,
+        }
+    }
+
+    pub fn is_force_warn(&self) -> bool {
+        match self.code {
+            Some(DiagnosticId::Lint { is_force_warn, .. }) => is_force_warn,
             _ => false,
         }
     }
@@ -291,6 +316,21 @@ impl Diagnostic {
         )
     }
 
+    /// Show a suggestion that has multiple parts to it, always as it's own subdiagnostic.
+    /// In other words, multiple changes need to be applied as part of this suggestion.
+    pub fn multipart_suggestion_verbose(
+        &mut self,
+        msg: &str,
+        suggestion: Vec<(Span, String)>,
+        applicability: Applicability,
+    ) -> &mut Self {
+        self.multipart_suggestion_with_style(
+            msg,
+            suggestion,
+            applicability,
+            SuggestionStyle::ShowAlways,
+        )
+    }
     /// [`Diagnostic::multipart_suggestion()`] but you can set the [`SuggestionStyle`].
     pub fn multipart_suggestion_with_style(
         &mut self,
@@ -425,10 +465,14 @@ impl Diagnostic {
         suggestions: impl Iterator<Item = String>,
         applicability: Applicability,
     ) -> &mut Self {
+        let mut suggestions: Vec<_> = suggestions.collect();
+        suggestions.sort();
+        let substitutions = suggestions
+            .into_iter()
+            .map(|snippet| Substitution { parts: vec![SubstitutionPart { snippet, span: sp }] })
+            .collect();
         self.suggestions.push(CodeSuggestion {
-            substitutions: suggestions
-                .map(|snippet| Substitution { parts: vec![SubstitutionPart { snippet, span: sp }] })
-                .collect(),
+            substitutions,
             msg: msg.to_owned(),
             style: SuggestionStyle::ShowCode,
             applicability,
@@ -437,6 +481,30 @@ impl Diagnostic {
         self
     }
 
+    /// Prints out a message with multiple suggested edits of the code.
+    /// See also [`Diagnostic::span_suggestion()`].
+    pub fn multipart_suggestions(
+        &mut self,
+        msg: &str,
+        suggestions: impl Iterator<Item = Vec<(Span, String)>>,
+        applicability: Applicability,
+    ) -> &mut Self {
+        self.suggestions.push(CodeSuggestion {
+            substitutions: suggestions
+                .map(|sugg| Substitution {
+                    parts: sugg
+                        .into_iter()
+                        .map(|(span, snippet)| SubstitutionPart { snippet, span })
+                        .collect(),
+                })
+                .collect(),
+            msg: msg.to_owned(),
+            style: SuggestionStyle::ShowCode,
+            applicability,
+            tool_metadata: Default::default(),
+        });
+        self
+    }
     /// Prints out a message with a suggested edit of the code. If the suggestion is presented
     /// inline, it will only show the message and not the suggestion.
     ///
@@ -527,6 +595,11 @@ impl Diagnostic {
         self
     }
 
+    pub fn set_is_lint(&mut self) -> &mut Self {
+        self.is_lint = true;
+        self
+    }
+
     pub fn code(&mut self, s: DiagnosticId) -> &mut Self {
         self.code = Some(s);
         self
@@ -585,6 +658,42 @@ impl Diagnostic {
     ) {
         let sub = SubDiagnostic { level, message, span, render_span };
         self.children.push(sub);
+    }
+
+    /// Fields used for Hash, and PartialEq trait
+    fn keys(
+        &self,
+    ) -> (
+        &Level,
+        &Vec<(String, Style)>,
+        &Option<DiagnosticId>,
+        &MultiSpan,
+        &Vec<CodeSuggestion>,
+        Option<&Vec<SubDiagnostic>>,
+    ) {
+        (
+            &self.level,
+            &self.message,
+            &self.code,
+            &self.span,
+            &self.suggestions,
+            (if self.is_lint { None } else { Some(&self.children) }),
+        )
+    }
+}
+
+impl Hash for Diagnostic {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.keys().hash(state);
+    }
+}
+
+impl PartialEq for Diagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys() == other.keys()
     }
 }
 

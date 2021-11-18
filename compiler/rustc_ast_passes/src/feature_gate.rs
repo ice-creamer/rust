@@ -3,7 +3,7 @@ use rustc_ast::visit::{self, AssocCtxt, FnCtxt, FnKind, Visitor};
 use rustc_ast::{AssocTyConstraint, AssocTyConstraintKind, NodeId};
 use rustc_ast::{PatKind, RangeEnd, VariantData};
 use rustc_errors::struct_span_err;
-use rustc_feature::{AttributeGate, BUILTIN_ATTRIBUTE_MAP};
+use rustc_feature::{AttributeGate, BuiltinAttribute, BUILTIN_ATTRIBUTE_MAP};
 use rustc_feature::{Features, GateIssue};
 use rustc_session::parse::{feature_err, feature_err_issue};
 use rustc_session::Session;
@@ -287,7 +287,7 @@ impl<'a> PostExpansionVisitor<'a> {
                 if let ast::TyKind::ImplTrait(..) = ty.kind {
                     gate_feature_post!(
                         &self.vis,
-                        min_type_alias_impl_trait,
+                        type_alias_impl_trait,
                         ty.span,
                         "`impl Trait` in type aliases is unstable"
                     );
@@ -301,14 +301,17 @@ impl<'a> PostExpansionVisitor<'a> {
 
 impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     fn visit_attribute(&mut self, attr: &ast::Attribute) {
-        let attr_info =
-            attr.ident().and_then(|ident| BUILTIN_ATTRIBUTE_MAP.get(&ident.name)).map(|a| **a);
+        let attr_info = attr.ident().and_then(|ident| BUILTIN_ATTRIBUTE_MAP.get(&ident.name));
         // Check feature gates for built-in attributes.
-        if let Some((.., AttributeGate::Gated(_, name, descr, has_feature))) = attr_info {
-            gate_feature_fn!(self, has_feature, attr.span, name, descr);
+        if let Some(BuiltinAttribute {
+            gate: AttributeGate::Gated(_, name, descr, has_feature),
+            ..
+        }) = attr_info
+        {
+            gate_feature_fn!(self, has_feature, attr.span, *name, descr);
         }
         // Check unstable flavors of the `#[doc]` attribute.
-        if self.sess.check_name(attr, sym::doc) {
+        if attr.has_name(sym::doc) {
             for nested_meta in attr.meta_item_list().unwrap_or_default() {
                 macro_rules! gate_doc { ($($name:ident => $feature:ident)*) => {
                     $(if nested_meta.has_name(sym::$name) {
@@ -319,6 +322,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
                 gate_doc!(
                     cfg => doc_cfg
+                    cfg_hide => doc_cfg_hide
                     masked => doc_masked
                     notable_trait => doc_notable_trait
                     keyword => doc_keyword
@@ -327,7 +331,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         }
 
         // Check for unstable modifiers on `#[link(..)]` attribute
-        if self.sess.check_name(attr, sym::link) {
+        if attr.has_name(sym::link) {
             for nested_meta in attr.meta_item_list().unwrap_or_default() {
                 if nested_meta.has_name(sym::modifiers) {
                     gate_feature_post!(
@@ -375,14 +379,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             }
 
             ast::ItemKind::Fn(..) => {
-                if self.sess.contains_name(&i.attrs[..], sym::plugin_registrar) {
-                    gate_feature_post!(
-                        &self,
-                        plugin_registrar,
-                        i.span,
-                        "compiler plugins are experimental and possibly buggy"
-                    );
-                }
                 if self.sess.contains_name(&i.attrs[..], sym::start) {
                     gate_feature_post!(
                         &self,
@@ -430,9 +426,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 }
             }
 
-            ast::ItemKind::Impl(box ast::ImplKind {
-                polarity, defaultness, ref of_trait, ..
-            }) => {
+            ast::ItemKind::Impl(box ast::Impl { polarity, defaultness, ref of_trait, .. }) => {
                 if let ast::ImplPolarity::Negative(span) = polarity {
                     gate_feature_post!(
                         &self,
@@ -448,7 +442,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 }
             }
 
-            ast::ItemKind::Trait(box ast::TraitKind(ast::IsAuto::Yes, ..)) => {
+            ast::ItemKind::Trait(box ast::Trait { is_auto: ast::IsAuto::Yes, .. }) => {
                 gate_feature_post!(
                     &self,
                     auto_traits,
@@ -466,7 +460,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 gate_feature_post!(&self, decl_macro, i.span, msg);
             }
 
-            ast::ItemKind::TyAlias(box ast::TyAliasKind(_, _, _, Some(ref ty))) => {
+            ast::ItemKind::TyAlias(box ast::TyAlias { ty: Some(ref ty), .. }) => {
                 self.check_impl_trait(&ty)
             }
 
@@ -548,15 +542,13 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             ast::ExprKind::TryBlock(_) => {
                 gate_feature_post!(&self, try_blocks, e.span, "`try` expression is experimental");
             }
-            ast::ExprKind::Block(_, opt_label) => {
-                if let Some(label) = opt_label {
-                    gate_feature_post!(
-                        &self,
-                        label_break_value,
-                        label.ident.span,
-                        "labels on blocks are unstable"
-                    );
-                }
+            ast::ExprKind::Block(_, Some(label)) => {
+                gate_feature_post!(
+                    &self,
+                    label_break_value,
+                    label.ident.span,
+                    "labels on blocks are unstable"
+                );
             }
             _ => {}
         }
@@ -565,6 +557,22 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
     fn visit_pat(&mut self, pattern: &'a ast::Pat) {
         match &pattern.kind {
+            PatKind::Slice(pats) => {
+                for pat in pats {
+                    let inner_pat = match &pat.kind {
+                        PatKind::Ident(.., Some(pat)) => pat,
+                        _ => pat,
+                    };
+                    if let PatKind::Range(Some(_), None, Spanned { .. }) = inner_pat.kind {
+                        gate_feature_post!(
+                            &self,
+                            half_open_range_patterns,
+                            pat.span,
+                            "`X..` patterns in slices are experimental"
+                        );
+                    }
+                }
+            }
             PatKind::Box(..) => {
                 gate_feature_post!(
                     &self,
@@ -573,7 +581,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                     "box pattern syntax is experimental"
                 );
             }
-            PatKind::Range(_, _, Spanned { node: RangeEnd::Excluded, .. }) => {
+            PatKind::Range(_, Some(_), Spanned { node: RangeEnd::Excluded, .. }) => {
                 gate_feature_post!(
                     &self,
                     exclusive_range_pattern,
@@ -625,7 +633,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     fn visit_assoc_item(&mut self, i: &'a ast::AssocItem, ctxt: AssocCtxt) {
         let is_fn = match i.kind {
             ast::AssocItemKind::Fn(_) => true,
-            ast::AssocItemKind::TyAlias(box ast::TyAliasKind(_, ref generics, _, ref ty)) => {
+            ast::AssocItemKind::TyAlias(box ast::TyAlias { ref generics, ref ty, .. }) => {
                 if let (Some(_), AssocCtxt::Trait) = (ty, ctxt) {
                     gate_feature_post!(
                         &self,
@@ -708,7 +716,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session) {
     gate_all!(more_qualified_paths, "usage of qualified paths in this context is experimental");
     gate_all!(generators, "yield syntax is experimental");
     gate_all!(raw_ref_op, "raw address of syntax is experimental");
-    gate_all!(const_trait_bound_opt_out, "`?const` on trait bounds is experimental");
     gate_all!(const_trait_impl, "const trait impls are experimental");
     gate_all!(half_open_range_patterns, "half-open range patterns are unstable");
     gate_all!(inline_const, "inline-const is experimental");
@@ -721,7 +728,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session) {
         // involved, so we only emit errors where there are no other parsing errors.
         gate_all!(destructuring_assignment, "destructuring assignments are unstable");
     }
-    gate_all!(unnamed_fields, "unnamed fields are not yet fully implemented");
 
     // All uses of `gate_all!` below this point were added in #65742,
     // and subsequently disabled (with the non-early gating readded).
@@ -740,7 +746,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session) {
     gate_all!(trait_alias, "trait aliases are experimental");
     gate_all!(associated_type_bounds, "associated type bounds are unstable");
     gate_all!(crate_visibility_modifier, "`crate` visibility modifier is experimental");
-    gate_all!(const_generics, "const generics are unstable");
     gate_all!(decl_macro, "`macro` is experimental");
     gate_all!(box_patterns, "box pattern syntax is experimental");
     gate_all!(exclusive_range_pattern, "exclusive range pattern syntax is experimental");
@@ -757,11 +762,17 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session) {
 }
 
 fn maybe_stage_features(sess: &Session, krate: &ast::Crate) {
+    // checks if `#![feature]` has been used to enable any lang feature
+    // does not check the same for lib features unless there's at least one
+    // declared lang feature
     use rustc_errors::Applicability;
 
     if !sess.opts.unstable_features.is_nightly_build() {
         let lang_features = &sess.features_untracked().declared_lang_features;
-        for attr in krate.attrs.iter().filter(|attr| sess.check_name(attr, sym::feature)) {
+        if lang_features.len() == 0 {
+            return;
+        }
+        for attr in krate.attrs.iter().filter(|attr| attr.has_name(sym::feature)) {
             let mut err = struct_span_err!(
                 sess.parse_sess.span_diagnostic,
                 attr.span,

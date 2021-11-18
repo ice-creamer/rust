@@ -4,11 +4,14 @@ use crate::infer::error_reporting::nice_region_error::NiceRegionError;
 use crate::infer::lexical_region_resolve::RegionResolutionError;
 use crate::infer::{SubregionOrigin, TypeTrace};
 use crate::traits::{ObligationCauseCode, UnifyReceiverContext};
+use rustc_data_structures::stable_set::FxHashSet;
 use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder, ErrorReported};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{walk_ty, ErasedMap, NestedVisitorMap, Visitor};
 use rustc_hir::{self as hir, GenericBound, Item, ItemKind, Lifetime, LifetimeName, Node, TyKind};
-use rustc_middle::ty::{self, AssocItemContainer, RegionKind, Ty, TypeFoldable, TypeVisitor};
+use rustc_middle::ty::{
+    self, AssocItemContainer, RegionKind, Ty, TyCtxt, TypeFoldable, TypeVisitor,
+};
 use rustc_span::symbol::Ident;
 use rustc_span::{MultiSpan, Span};
 
@@ -185,17 +188,20 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             }
         }
         if let SubregionOrigin::Subtype(box TypeTrace { cause, .. }) = &sub_origin {
-            if let ObligationCauseCode::ItemObligation(item_def_id) = cause.code {
+            let code = match &cause.code {
+                ObligationCauseCode::MatchImpl(parent, ..) => &parent.code,
+                _ => &cause.code,
+            };
+            if let ObligationCauseCode::ItemObligation(item_def_id) = *code {
                 // Same case of `impl Foo for dyn Bar { fn qux(&self) {} }` introducing a `'static`
                 // lifetime as above, but called using a fully-qualified path to the method:
                 // `Foo::qux(bar)`.
-                let mut v = TraitObjectVisitor(vec![]);
+                let mut v = TraitObjectVisitor(FxHashSet::default());
                 v.visit_ty(param.param_ty);
                 if let Some((ident, self_ty)) =
-                    self.get_impl_ident_and_self_ty_from_trait(item_def_id, &v.0[..])
+                    self.get_impl_ident_and_self_ty_from_trait(item_def_id, &v.0)
                 {
-                    if self.suggest_constrain_dyn_trait_in_impl(&mut err, &v.0[..], ident, self_ty)
-                    {
+                    if self.suggest_constrain_dyn_trait_in_impl(&mut err, &v.0, ident, self_ty) {
                         override_error_code = Some(ident);
                     }
                 }
@@ -211,132 +217,161 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             ));
         }
 
-        debug!("try_report_static_impl_trait: fn_return={:?}", fn_returns);
-        // FIXME: account for the need of parens in `&(dyn Trait + '_)`
-        let consider = "consider changing the";
-        let declare = "to declare that the";
         let arg = match param.param.pat.simple_ident() {
             Some(simple_ident) => format!("argument `{}`", simple_ident),
             None => "the argument".to_string(),
         };
-        let explicit = format!("you can add an explicit `{}` lifetime bound", lifetime_name);
-        let explicit_static = format!("explicit `'static` bound to the lifetime of {}", arg);
         let captures = format!("captures data from {}", arg);
-        let add_static_bound = "alternatively, add an explicit `'static` bound to this reference";
-        let plus_lt = format!(" + {}", lifetime_name);
-        for fn_return in fn_returns {
-            if fn_return.span.desugaring_kind().is_some() {
-                // Skip `async` desugaring `impl Future`.
-                continue;
-            }
-            match fn_return.kind {
-                TyKind::OpaqueDef(item_id, _) => {
-                    let item = tcx.hir().item(item_id);
-                    let opaque = if let ItemKind::OpaqueTy(opaque) = &item.kind {
-                        opaque
-                    } else {
-                        err.emit();
-                        return Some(ErrorReported);
-                    };
+        suggest_new_region_bound(
+            tcx,
+            &mut err,
+            fn_returns,
+            lifetime_name,
+            Some(arg),
+            captures,
+            Some((param.param_ty_span, param.param_ty.to_string())),
+        );
 
-                    if let Some(span) = opaque
-                        .bounds
-                        .iter()
-                        .filter_map(|arg| match arg {
-                            GenericBound::Outlives(Lifetime {
-                                name: LifetimeName::Static,
-                                span,
-                                ..
-                            }) => Some(*span),
-                            _ => None,
-                        })
-                        .next()
-                    {
+        err.emit();
+        Some(ErrorReported)
+    }
+}
+
+pub fn suggest_new_region_bound(
+    tcx: TyCtxt<'tcx>,
+    err: &mut DiagnosticBuilder<'_>,
+    fn_returns: Vec<&rustc_hir::Ty<'_>>,
+    lifetime_name: String,
+    arg: Option<String>,
+    captures: String,
+    param: Option<(Span, String)>,
+) {
+    debug!("try_report_static_impl_trait: fn_return={:?}", fn_returns);
+    // FIXME: account for the need of parens in `&(dyn Trait + '_)`
+    let consider = "consider changing the";
+    let declare = "to declare that the";
+    let explicit = format!("you can add an explicit `{}` lifetime bound", lifetime_name);
+    let explicit_static =
+        arg.map(|arg| format!("explicit `'static` bound to the lifetime of {}", arg));
+    let add_static_bound = "alternatively, add an explicit `'static` bound to this reference";
+    let plus_lt = format!(" + {}", lifetime_name);
+    for fn_return in fn_returns {
+        if fn_return.span.desugaring_kind().is_some() {
+            // Skip `async` desugaring `impl Future`.
+            continue;
+        }
+        match fn_return.kind {
+            TyKind::OpaqueDef(item_id, _) => {
+                let item = tcx.hir().item(item_id);
+                let ItemKind::OpaqueTy(opaque) = &item.kind else {
+                    return;
+                };
+
+                if let Some(span) = opaque
+                    .bounds
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        GenericBound::Outlives(Lifetime {
+                            name: LifetimeName::Static,
+                            span,
+                            ..
+                        }) => Some(*span),
+                        _ => None,
+                    })
+                    .next()
+                {
+                    if let Some(explicit_static) = &explicit_static {
                         err.span_suggestion_verbose(
                             span,
                             &format!("{} `impl Trait`'s {}", consider, explicit_static),
                             lifetime_name.clone(),
                             Applicability::MaybeIncorrect,
                         );
+                    }
+                    if let Some((param_span, param_ty)) = param.clone() {
                         err.span_suggestion_verbose(
-                            param.param_ty_span,
+                            param_span,
                             add_static_bound,
-                            param.param_ty.to_string(),
-                            Applicability::MaybeIncorrect,
-                        );
-                    } else if opaque
-                        .bounds
-                        .iter()
-                        .filter_map(|arg| match arg {
-                            GenericBound::Outlives(Lifetime { name, span, .. })
-                                if name.ident().to_string() == lifetime_name =>
-                            {
-                                Some(*span)
-                            }
-                            _ => None,
-                        })
-                        .next()
-                        .is_some()
-                    {
-                    } else {
-                        err.span_suggestion_verbose(
-                            fn_return.span.shrink_to_hi(),
-                            &format!(
-                                "{declare} `impl Trait` {captures}, {explicit}",
-                                declare = declare,
-                                captures = captures,
-                                explicit = explicit,
-                            ),
-                            plus_lt.clone(),
+                            param_ty,
                             Applicability::MaybeIncorrect,
                         );
                     }
+                } else if opaque
+                    .bounds
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        GenericBound::Outlives(Lifetime { name, span, .. })
+                            if name.ident().to_string() == lifetime_name =>
+                        {
+                            Some(*span)
+                        }
+                        _ => None,
+                    })
+                    .next()
+                    .is_some()
+                {
+                } else {
+                    err.span_suggestion_verbose(
+                        fn_return.span.shrink_to_hi(),
+                        &format!(
+                            "{declare} `impl Trait` {captures}, {explicit}",
+                            declare = declare,
+                            captures = captures,
+                            explicit = explicit,
+                        ),
+                        plus_lt.clone(),
+                        Applicability::MaybeIncorrect,
+                    );
                 }
-                TyKind::TraitObject(_, lt, _) => match lt.name {
-                    LifetimeName::ImplicitObjectLifetimeDefault => {
-                        err.span_suggestion_verbose(
-                            fn_return.span.shrink_to_hi(),
-                            &format!(
-                                "{declare} trait object {captures}, {explicit}",
-                                declare = declare,
-                                captures = captures,
-                                explicit = explicit,
-                            ),
-                            plus_lt.clone(),
-                            Applicability::MaybeIncorrect,
-                        );
-                    }
-                    name if name.ident().to_string() != lifetime_name => {
-                        // With this check we avoid suggesting redundant bounds. This
-                        // would happen if there are nested impl/dyn traits and only
-                        // one of them has the bound we'd suggest already there, like
-                        // in `impl Foo<X = dyn Bar> + '_`.
+            }
+            TyKind::TraitObject(_, lt, _) => match lt.name {
+                LifetimeName::ImplicitObjectLifetimeDefault => {
+                    err.span_suggestion_verbose(
+                        fn_return.span.shrink_to_hi(),
+                        &format!(
+                            "{declare} trait object {captures}, {explicit}",
+                            declare = declare,
+                            captures = captures,
+                            explicit = explicit,
+                        ),
+                        plus_lt.clone(),
+                        Applicability::MaybeIncorrect,
+                    );
+                }
+                name if name.ident().to_string() != lifetime_name => {
+                    // With this check we avoid suggesting redundant bounds. This
+                    // would happen if there are nested impl/dyn traits and only
+                    // one of them has the bound we'd suggest already there, like
+                    // in `impl Foo<X = dyn Bar> + '_`.
+                    if let Some(explicit_static) = &explicit_static {
                         err.span_suggestion_verbose(
                             lt.span,
                             &format!("{} trait object's {}", consider, explicit_static),
                             lifetime_name.clone(),
                             Applicability::MaybeIncorrect,
                         );
+                    }
+                    if let Some((param_span, param_ty)) = param.clone() {
                         err.span_suggestion_verbose(
-                            param.param_ty_span,
+                            param_span,
                             add_static_bound,
-                            param.param_ty.to_string(),
+                            param_ty,
                             Applicability::MaybeIncorrect,
                         );
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
-            }
+            },
+            _ => {}
         }
-        err.emit();
-        Some(ErrorReported)
     }
+}
 
+impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     fn get_impl_ident_and_self_ty_from_trait(
         &self,
         def_id: DefId,
-        trait_objects: &[DefId],
+        trait_objects: &FxHashSet<DefId>,
     ) -> Option<(Ident, &'tcx hir::Ty<'tcx>)> {
         let tcx = self.tcx();
         match tcx.hir().get_if_local(def_id) {
@@ -373,9 +408,10 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
                                         // multiple `impl`s for the same trait like
                                         // `impl Foo for Box<dyn Bar>` and `impl Foo for dyn Bar`.
                                         // In that case, only the first one will get suggestions.
-                                        let mut hir_v = HirTraitObjectVisitor(vec![], *did);
+                                        let mut traits = vec![];
+                                        let mut hir_v = HirTraitObjectVisitor(&mut traits, *did);
                                         hir_v.visit_ty(self_ty);
-                                        !hir_v.0.is_empty()
+                                        !traits.is_empty()
                                     }) =>
                                     {
                                         Some(self_ty)
@@ -417,33 +453,34 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             _ => return false,
         };
 
-        let mut v = TraitObjectVisitor(vec![]);
+        let mut v = TraitObjectVisitor(FxHashSet::default());
         v.visit_ty(ty);
 
         // Get the `Ident` of the method being called and the corresponding `impl` (to point at
         // `Bar` in `impl Foo for dyn Bar {}` and the definition of the method being called).
         let (ident, self_ty) =
-            match self.get_impl_ident_and_self_ty_from_trait(instance.def_id(), &v.0[..]) {
+            match self.get_impl_ident_and_self_ty_from_trait(instance.def_id(), &v.0) {
                 Some((ident, self_ty)) => (ident, self_ty),
                 None => return false,
             };
 
         // Find the trait object types in the argument, so we point at *only* the trait object.
-        self.suggest_constrain_dyn_trait_in_impl(err, &v.0[..], ident, self_ty)
+        self.suggest_constrain_dyn_trait_in_impl(err, &v.0, ident, self_ty)
     }
 
     fn suggest_constrain_dyn_trait_in_impl(
         &self,
         err: &mut DiagnosticBuilder<'_>,
-        found_dids: &[DefId],
+        found_dids: &FxHashSet<DefId>,
         ident: Ident,
         self_ty: &hir::Ty<'_>,
     ) -> bool {
         let mut suggested = false;
         for found_did in found_dids {
-            let mut hir_v = HirTraitObjectVisitor(vec![], *found_did);
+            let mut traits = vec![];
+            let mut hir_v = HirTraitObjectVisitor(&mut traits, *found_did);
             hir_v.visit_ty(&self_ty);
-            for span in &hir_v.0 {
+            for span in &traits {
                 let mut multi_span: MultiSpan = vec![*span].into();
                 multi_span.push_span_label(
                     *span,
@@ -468,14 +505,20 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 }
 
 /// Collect all the trait objects in a type that could have received an implicit `'static` lifetime.
-struct TraitObjectVisitor(Vec<DefId>);
+pub(super) struct TraitObjectVisitor(pub(super) FxHashSet<DefId>);
 
-impl TypeVisitor<'_> for TraitObjectVisitor {
-    fn visit_ty(&mut self, t: Ty<'_>) -> ControlFlow<Self::BreakTy> {
+impl<'tcx> TypeVisitor<'tcx> for TraitObjectVisitor {
+    fn tcx_for_anon_const_substs(&self) -> Option<TyCtxt<'tcx>> {
+        // The default anon const substs cannot include
+        // trait objects, so we don't have to bother looking.
+        None
+    }
+
+    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
         match t.kind() {
             ty::Dynamic(preds, RegionKind::ReStatic) => {
                 if let Some(def_id) = preds.principal_def_id() {
-                    self.0.push(def_id);
+                    self.0.insert(def_id);
                 }
                 ControlFlow::CONTINUE
             }
@@ -485,9 +528,9 @@ impl TypeVisitor<'_> for TraitObjectVisitor {
 }
 
 /// Collect all `hir::Ty<'_>` `Span`s for trait objects with an implicit lifetime.
-struct HirTraitObjectVisitor(Vec<Span>, DefId);
+pub(super) struct HirTraitObjectVisitor<'a>(pub(super) &'a mut Vec<Span>, pub(super) DefId);
 
-impl<'tcx> Visitor<'tcx> for HirTraitObjectVisitor {
+impl<'a, 'tcx> Visitor<'tcx> for HirTraitObjectVisitor<'a> {
     type Map = ErasedMap<'tcx>;
 
     fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {

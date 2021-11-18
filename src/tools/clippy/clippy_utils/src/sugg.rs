@@ -16,10 +16,10 @@ use std::convert::TryInto;
 use std::fmt::Display;
 use std::ops::{Add, Neg, Not, Sub};
 
-/// A helper type to build suggestion correctly handling parenthesis.
+/// A helper type to build suggestion correctly handling parentheses.
 #[derive(Clone, PartialEq)]
 pub enum Sugg<'a> {
-    /// An expression that never needs parenthesis such as `1337` or `[0; 42]`.
+    /// An expression that never needs parentheses such as `1337` or `[0; 42]`.
     NonParen(Cow<'a, str>),
     /// An expression that does not fit in other variants.
     MaybeParen(Cow<'a, str>),
@@ -116,7 +116,7 @@ impl<'a> Sugg<'a> {
     /// Generate a suggestion for an expression with the given snippet. This is used by the `hir_*`
     /// function variants of `Sugg`, since these use different snippet functions.
     fn hir_from_snippet(expr: &hir::Expr<'_>, snippet: Cow<'a, str>) -> Self {
-        if let Some(range) = higher::range(expr) {
+        if let Some(range) = higher::Range::hir(expr) {
             let op = match range.limits {
                 ast::RangeLimits::HalfOpen => AssocOp::DotDot,
                 ast::RangeLimits::Closed => AssocOp::DotDotEq,
@@ -128,6 +128,7 @@ impl<'a> Sugg<'a> {
             hir::ExprKind::AddrOf(..)
             | hir::ExprKind::Box(..)
             | hir::ExprKind::If(..)
+            | hir::ExprKind::Let(..)
             | hir::ExprKind::Closure(..)
             | hir::ExprKind::Unary(..)
             | hir::ExprKind::Match(..) => Sugg::MaybeParen(snippet),
@@ -154,7 +155,7 @@ impl<'a> Sugg<'a> {
             | hir::ExprKind::Err => Sugg::NonParen(snippet),
             hir::ExprKind::Assign(..) => Sugg::BinOp(AssocOp::Assign, snippet),
             hir::ExprKind::AssignOp(op, ..) => Sugg::BinOp(hirbinop2assignop(op), snippet),
-            hir::ExprKind::Binary(op, ..) => Sugg::BinOp(AssocOp::from_ast_binop(higher::binop(op.node)), snippet),
+            hir::ExprKind::Binary(op, ..) => Sugg::BinOp(AssocOp::from_ast_binop(op.node.into()), snippet),
             hir::ExprKind::Cast(..) => Sugg::BinOp(AssocOp::As, snippet),
             hir::ExprKind::Type(..) => Sugg::BinOp(AssocOp::Colon, snippet),
         }
@@ -282,7 +283,7 @@ impl<'a> Sugg<'a> {
         }
     }
 
-    /// Adds parenthesis to any expression that might need them. Suitable to the
+    /// Adds parentheses to any expression that might need them. Suitable to the
     /// `self` argument of a method call
     /// (e.g., to build `bar.foo()` or `(1 + 2).foo()`).
     pub fn maybe_par(self) -> Self {
@@ -310,7 +311,7 @@ impl<'a> Sugg<'a> {
 /// Return `true` if `sugg` is enclosed in parenthesis.
 fn has_enclosing_paren(sugg: impl AsRef<str>) -> bool {
     let mut chars = sugg.as_ref().chars();
-    if let Some('(') = chars.next() {
+    if chars.next() == Some('(') {
         let mut depth = 1;
         for c in &mut chars {
             if c == '(' {
@@ -328,7 +329,7 @@ fn has_enclosing_paren(sugg: impl AsRef<str>) -> bool {
     }
 }
 
-// Copied from the rust standart library, and then edited
+/// Copied from the rust standard library, and then edited
 macro_rules! forward_binop_impls_to_ref {
     (impl $imp:ident, $method:ident for $t:ty, type Output = $o:ty) => {
         impl $imp<$t> for &$t {
@@ -433,7 +434,7 @@ pub fn make_assoc(op: AssocOp, lhs: &Sugg<'_>, rhs: &Sugg<'_>) -> Sugg<'static> 
         matches!(op, AssocOp::ShiftLeft | AssocOp::ShiftRight)
     }
 
-    /// Returns `true` if the operator is a arithmetic operator
+    /// Returns `true` if the operator is an arithmetic operator
     /// (i.e., `+`, `-`, `*`, `/`, `%`).
     fn is_arith(op: AssocOp) -> bool {
         matches!(

@@ -1,5 +1,4 @@
 use crate::dep_graph::{DepNode, WorkProduct, WorkProductId};
-use crate::ich::{NodeIdHashingMode, StableHashingContext};
 use crate::ty::{subst::InternalSubsts, Instance, InstanceDef, SymbolName, TyCtxt};
 use rustc_attr::InlineAttr;
 use rustc_data_structures::base_n;
@@ -8,6 +7,7 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc_hir::{HirId, ItemId};
+use rustc_query_system::ich::{NodeIdHashingMode, StableHashingContext};
 use rustc_session::config::OptLevel;
 use rustc_span::source_map::Span;
 use rustc_span::symbol::Symbol;
@@ -47,6 +47,14 @@ pub enum MonoItem<'tcx> {
 }
 
 impl<'tcx> MonoItem<'tcx> {
+    /// Returns `true` if the mono item is user-defined (i.e. not compiler-generated, like shims).
+    pub fn is_user_defined(&self) -> bool {
+        match *self {
+            MonoItem::Fn(instance) => matches!(instance.def, InstanceDef::Item(..)),
+            MonoItem::Static(..) | MonoItem::GlobalAsm(..) => true,
+        }
+    }
+
     pub fn size_estimate(&self, tcx: TyCtxt<'tcx>) -> usize {
         match *self {
             MonoItem::Fn(instance) => {
@@ -490,15 +498,23 @@ impl CodegenUnitNameBuilder<'tcx> {
             // local crate's ID. Otherwise there can be collisions between CGUs
             // instantiating stuff for upstream crates.
             let local_crate_id = if cnum != LOCAL_CRATE {
-                let local_crate_disambiguator = format!("{}", tcx.crate_disambiguator(LOCAL_CRATE));
-                format!("-in-{}.{}", tcx.crate_name(LOCAL_CRATE), &local_crate_disambiguator[0..8])
+                let local_stable_crate_id = tcx.sess.local_stable_crate_id();
+                format!(
+                    "-in-{}.{:08x}",
+                    tcx.crate_name(LOCAL_CRATE),
+                    local_stable_crate_id.to_u64() as u32,
+                )
             } else {
                 String::new()
             };
 
-            let crate_disambiguator = tcx.crate_disambiguator(cnum).to_string();
-            // Using a shortened disambiguator of about 40 bits
-            format!("{}.{}{}", tcx.crate_name(cnum), &crate_disambiguator[0..8], local_crate_id)
+            let stable_crate_id = tcx.sess.local_stable_crate_id();
+            format!(
+                "{}.{:08x}{}",
+                tcx.crate_name(cnum),
+                stable_crate_id.to_u64() as u32,
+                local_crate_id,
+            )
         });
 
         write!(cgu_name, "{}", crate_prefix).unwrap();

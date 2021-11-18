@@ -23,7 +23,19 @@ use crate::sys_common::rwlock as sys;
 /// system's implementation, and this type does not guarantee that any
 /// particular policy will be used. In particular, a writer which is waiting to
 /// acquire the lock in `write` might or might not block concurrent calls to
-/// `read`.
+/// `read`, e.g.:
+///
+/// <details><summary>Potential deadlock example</summary>
+///
+/// ```text
+/// // Thread 1             |  // Thread 2
+/// let _rg = lock.read();  |
+///                         |  // will block
+///                         |  let _wg = lock.write();
+/// // may deadlock         |
+/// let _rg = lock.read();  |
+/// ```
+/// </details>
 ///
 /// The type parameter `T` represents the data that this lock protects. It is
 /// required that `T` satisfies [`Send`] to be shared across threads and
@@ -83,6 +95,12 @@ unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
 /// [`read`]: RwLock::read
 /// [`try_read`]: RwLock::try_read
 #[must_use = "if unused the RwLock will immediately unlock"]
+#[cfg_attr(
+    not(bootstrap),
+    must_not_suspend = "holding a RwLockReadGuard across suspend \
+                      points can cause deadlocks, delays, \
+                      and cause Futures to not implement `Send`"
+)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct RwLockReadGuard<'a, T: ?Sized + 'a> {
     lock: &'a RwLock<T>,
@@ -103,6 +121,12 @@ unsafe impl<T: ?Sized + Sync> Sync for RwLockReadGuard<'_, T> {}
 /// [`write`]: RwLock::write
 /// [`try_write`]: RwLock::try_write
 #[must_use = "if unused the RwLock will immediately unlock"]
+#[cfg_attr(
+    not(bootstrap),
+    must_not_suspend = "holding a RwLockWriteGuard across suspend \
+                      points can cause deadlocks, delays, \
+                      and cause Future's to not implement `Send`"
+)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
     lock: &'a RwLock<T>,

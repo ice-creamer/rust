@@ -1,7 +1,7 @@
+// edition:2021
 //check-pass
-#![feature(capture_disjoint_fields)]
-//~^ WARNING: the feature `capture_disjoint_fields` is incomplete
 #![warn(unused)]
+#![allow(dead_code)]
 #![feature(rustc_attrs)]
 
 #[derive(Debug, Clone, Copy)]

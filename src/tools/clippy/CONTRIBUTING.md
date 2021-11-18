@@ -115,7 +115,7 @@ To work around this, you need to have a copy of the [rustc-repo][rustc_repo] ava
 `git clone https://github.com/rust-lang/rust/`.
 Then you can run a `cargo dev` command to automatically make Clippy use the rustc-repo via path-dependencies
 which `IntelliJ Rust` will be able to understand.
-Run `cargo dev ide_setup --repo-path <repo-path>` where `<repo-path>` is a path to the rustc repo
+Run `cargo dev setup intellij --repo-path <repo-path>` where `<repo-path>` is a path to the rustc repo
 you just cloned.
 The command will add path-dependencies pointing towards rustc-crates inside the rustc repo to
 Clippys `Cargo.toml`s and should allow `IntelliJ Rust` to understand most of the types that Clippy uses.
@@ -262,7 +262,9 @@ to be run inside the `rust` directory):
 2. Checkout the commit from the latest available nightly. You can get it using `rustup check`.
 3. Sync the changes to the rust-copy of Clippy to your Clippy fork:
     ```bash
-    # Make sure to change `your-github-name` to your github name in the following command
+    # Make sure to change `your-github-name` to your github name in the following command. Also be
+    # sure to either use a net-new branch, e.g. `sync-from-rust`, or delete the branch beforehand
+    # because changes cannot be fast forwarded
     git subtree push -P src/tools/clippy git@github.com:your-github-name/rust-clippy sync-from-rust
     ```
 
@@ -342,7 +344,7 @@ We have prioritization labels and a sync-blocker label, which are described belo
 - [P-low][p-low]: Requires attention (fix/response/evaluation) by a team member but isn't urgent.
 - [P-medium][p-medium]: Should be addressed by a team member until the next sync.
 - [P-high][p-high]: Should be immediately addressed and will require an out-of-cycle sync or a backport.
-- [L-sync-blocker][l-sync-blocker]: An issue that "blocks" a sync. 
+- [L-sync-blocker][l-sync-blocker]: An issue that "blocks" a sync.
 Or rather: before the sync this should be addressed,
 e.g. by removing a lint again, so it doesn't hit beta/stable.
 

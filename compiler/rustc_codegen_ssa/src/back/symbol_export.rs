@@ -11,7 +11,7 @@ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::exported_symbols::{
     metadata_symbol_name, ExportedSymbol, SymbolExportLevel,
 };
-use rustc_middle::ty::query::Providers;
+use rustc_middle::ty::query::{ExternProviders, Providers};
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::Instance;
 use rustc_middle::ty::{SymbolName, TyCtxt};
@@ -137,10 +137,6 @@ fn reachable_non_generics_provider(tcx: TyCtxt<'_>, cnum: CrateNum) -> DefIdMap<
         reachable_non_generics.insert(id.to_def_id(), SymbolExportLevel::C);
     }
 
-    if let Some(id) = tcx.plugin_registrar_fn(()) {
-        reachable_non_generics.insert(id.to_def_id(), SymbolExportLevel::C);
-    }
-
     reachable_non_generics
 }
 
@@ -180,7 +176,7 @@ fn exported_symbols_provider_local(
         symbols.push((exported_symbol, SymbolExportLevel::C));
     }
 
-    if tcx.allocator_kind().is_some() {
+    if tcx.allocator_kind(()).is_some() {
         for method in ALLOCATOR_METHODS {
             let symbol_name = format!("__rust_{}", method.name);
             let exported_symbol = ExportedSymbol::NoDefId(SymbolName::new(tcx, &symbol_name));
@@ -277,7 +273,7 @@ fn upstream_monomorphizations_provider(
     tcx: TyCtxt<'_>,
     (): (),
 ) -> DefIdMap<FxHashMap<SubstsRef<'_>, CrateNum>> {
-    let cnums = tcx.all_crate_nums(());
+    let cnums = tcx.crates(());
 
     let mut instances: DefIdMap<FxHashMap<_, _>> = Default::default();
 
@@ -367,7 +363,7 @@ pub fn provide(providers: &mut Providers) {
     providers.wasm_import_module_map = wasm_import_module_map;
 }
 
-pub fn provide_extern(providers: &mut Providers) {
+pub fn provide_extern(providers: &mut ExternProviders) {
     providers.is_reachable_non_generic = is_reachable_non_generic_provider_extern;
     providers.upstream_monomorphizations_for = upstream_monomorphizations_for_provider;
 }

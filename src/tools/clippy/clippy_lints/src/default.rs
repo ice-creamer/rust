@@ -1,5 +1,6 @@
 use clippy_utils::diagnostics::{span_lint_and_note, span_lint_and_sugg};
 use clippy_utils::source::snippet_with_macro_callsite;
+use clippy_utils::ty::{has_drop, is_copy};
 use clippy_utils::{any_parent_is_automatically_derived, contains_name, in_macro, match_def_path, paths};
 use if_chain::if_chain;
 use rustc_data_structures::fx::FxHashSet;
@@ -7,21 +8,20 @@ use rustc_errors::Applicability;
 use rustc_hir::def::Res;
 use rustc_hir::{Block, Expr, ExprKind, PatKind, QPath, Stmt, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::Span;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for literal calls to `Default::default()`.
+    /// ### What it does
+    /// Checks for literal calls to `Default::default()`.
     ///
-    /// **Why is this bad?** It's more clear to the reader to use the name of the type whose default is
+    /// ### Why is this bad?
+    /// It's more clear to the reader to use the name of the type whose default is
     /// being gotten than the generic `Default`.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust
     /// // Bad
     /// let s: String = Default::default();
@@ -35,14 +35,17 @@ declare_clippy_lint! {
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for immediate reassignment of fields initialized
+    /// ### What it does
+    /// Checks for immediate reassignment of fields initialized
     /// with Default::default().
     ///
-    /// **Why is this bad?**It's more idiomatic to use the [functional update syntax](https://doc.rust-lang.org/reference/expressions/struct-expr.html#functional-update-syntax).
+    /// ### Why is this bad?
+    ///It's more idiomatic to use the [functional update syntax](https://doc.rust-lang.org/reference/expressions/struct-expr.html#functional-update-syntax).
     ///
-    /// **Known problems:** Assignments to patterns that are of tuple type are not linted.
+    /// ### Known problems
+    /// Assignments to patterns that are of tuple type are not linted.
     ///
-    /// **Example:**
+    /// ### Example
     /// Bad:
     /// ```
     /// # #[derive(Default)]
@@ -122,7 +125,7 @@ impl LateLintPass<'_> for Default {
                 if let StmtKind::Local(local) = stmt.kind;
                 if let Some(expr) = local.init;
                 if !any_parent_is_automatically_derived(cx.tcx, expr.hir_id);
-                if !in_external_macro(cx.tcx.sess, expr.span);
+                if !in_macro(expr.span);
                 // only take bindings to identifiers
                 if let PatKind::Binding(_, binding_id, ident, _) = local.pat.kind;
                 // only when assigning `... = Default::default()`
@@ -137,6 +140,13 @@ impl LateLintPass<'_> for Default {
                     .fields
                     .iter()
                     .all(|field| field.vis.is_accessible_from(module_did, cx.tcx));
+                let all_fields_are_copy = variant
+                    .fields
+                    .iter()
+                    .all(|field| {
+                        is_copy(cx, cx.tcx.type_of(field.did))
+                    });
+                if !has_drop(cx, binding_type) || all_fields_are_copy;
                 then {
                     (local, variant, ident.name, binding_type, expr.span)
                 } else {

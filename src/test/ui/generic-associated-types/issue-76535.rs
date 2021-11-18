@@ -1,10 +1,9 @@
 #![feature(generic_associated_types)]
-//~^ WARNING the feature
 
 pub trait SubTrait {}
 
 pub trait SuperTrait {
-    type SubType<'a>: SubTrait;
+    type SubType<'a>: SubTrait where Self: 'a;
 
     fn get_sub<'a>(&'a mut self) -> Self::SubType<'a>;
 }

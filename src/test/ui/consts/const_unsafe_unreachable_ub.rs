@@ -1,6 +1,4 @@
-// build-fail
-
-#![feature(const_unreachable_unchecked)]
+// error-pattern: evaluation of constant value failed
 
 const unsafe fn foo(x: bool) -> bool {
     match x {
@@ -9,12 +7,8 @@ const unsafe fn foo(x: bool) -> bool {
     }
 }
 
-#[warn(const_err)]
 const BAR: bool = unsafe { foo(false) };
 
 fn main() {
-  assert_eq!(BAR, true);
-  //~^ ERROR E0080
-  //~| ERROR erroneous constant
-  //~| WARN this was previously accepted by the compiler but is being phased out
+    assert_eq!(BAR, true);
 }

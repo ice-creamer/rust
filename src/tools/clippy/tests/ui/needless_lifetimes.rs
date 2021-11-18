@@ -1,5 +1,5 @@
 #![warn(clippy::needless_lifetimes)]
-#![allow(dead_code, clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+#![allow(dead_code, clippy::needless_pass_by_value, clippy::unnecessary_wraps, dyn_drop)]
 
 fn distinct_lifetimes<'a, 'b>(_x: &'a u8, _y: &'b u8, _z: u8) {}
 
@@ -25,6 +25,11 @@ fn multiple_in_and_out_1<'a>(x: &'a u8, _y: &'a u8) -> &'a u8 {
 // No error; multiple input refs.
 fn multiple_in_and_out_2<'a, 'b>(x: &'a u8, _y: &'b u8) -> &'a u8 {
     x
+}
+
+// No error; multiple input refs
+async fn func<'a>(args: &[&'a str]) -> Option<&'a str> {
+    args.get(0).cloned()
 }
 
 // No error; static involved.

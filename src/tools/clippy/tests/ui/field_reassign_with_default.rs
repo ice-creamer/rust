@@ -29,6 +29,21 @@ struct C {
     i: Vec<i32>,
     j: i64,
 }
+
+#[derive(Default)]
+struct D {
+    a: Option<i32>,
+    b: Option<i32>,
+}
+
+macro_rules! m {
+    ($key:ident: $value:tt) => {{
+        let mut data = $crate::D::default();
+        data.$key = Some($value);
+        data
+    }};
+}
+
 /// Implements .next() that returns a different number each time.
 struct SideEffect(i32);
 
@@ -143,6 +158,11 @@ fn main() {
 
     let mut a: WrapperMulti<i32, i64> = Default::default();
     a.i = 42;
+
+    // Don't lint in macros
+    m! {
+        a: 42
+    };
 }
 
 mod m {
@@ -162,4 +182,68 @@ struct Wrapper<T> {
 struct WrapperMulti<T, U> {
     i: T,
     j: U,
+}
+
+mod issue6312 {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    // do not lint: type implements `Drop` but not all fields are `Copy`
+    #[derive(Clone, Default)]
+    pub struct ImplDropNotAllCopy {
+        name: String,
+        delay_data_sync: Arc<AtomicBool>,
+    }
+
+    impl Drop for ImplDropNotAllCopy {
+        fn drop(&mut self) {
+            self.close()
+        }
+    }
+
+    impl ImplDropNotAllCopy {
+        fn new(name: &str) -> Self {
+            let mut f = ImplDropNotAllCopy::default();
+            f.name = name.to_owned();
+            f
+        }
+        fn close(&self) {}
+    }
+
+    // lint: type implements `Drop` and all fields are `Copy`
+    #[derive(Clone, Default)]
+    pub struct ImplDropAllCopy {
+        name: usize,
+        delay_data_sync: bool,
+    }
+
+    impl Drop for ImplDropAllCopy {
+        fn drop(&mut self) {
+            self.close()
+        }
+    }
+
+    impl ImplDropAllCopy {
+        fn new(name: &str) -> Self {
+            let mut f = ImplDropAllCopy::default();
+            f.name = name.len();
+            f
+        }
+        fn close(&self) {}
+    }
+
+    // lint: type does not implement `Drop` though all fields are `Copy`
+    #[derive(Clone, Default)]
+    pub struct NoDropAllCopy {
+        name: usize,
+        delay_data_sync: bool,
+    }
+
+    impl NoDropAllCopy {
+        fn new(name: &str) -> Self {
+            let mut f = NoDropAllCopy::default();
+            f.name = name.len();
+            f
+        }
+    }
 }

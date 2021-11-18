@@ -120,6 +120,12 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
         })
     }
 
+    fn visit_expr_field(&mut self, f: &'a ast::ExprField) {
+        self.with_lint_attrs(f.id, &f.attrs, |cx| {
+            ast_visit::walk_expr_field(cx, f);
+        })
+    }
+
     fn visit_stmt(&mut self, s: &'a ast::Stmt) {
         // Add the statement's lint attributes to our
         // current state when checking the statement itself.
@@ -204,8 +210,10 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
     }
 
     fn visit_arm(&mut self, a: &'a ast::Arm) {
-        run_early_pass!(self, check_arm, a);
-        ast_visit::walk_arm(self, a);
+        self.with_lint_attrs(a.id, &a.attrs, |cx| {
+            run_early_pass!(cx, check_arm, a);
+            ast_visit::walk_arm(cx, a);
+        })
     }
 
     fn visit_expr_post(&mut self, e: &'a ast::Expr) {
@@ -321,12 +329,20 @@ fn early_lint_crate<T: EarlyLintPass>(
     sess: &Session,
     lint_store: &LintStore,
     krate: &ast::Crate,
+    crate_attrs: &[ast::Attribute],
     pass: T,
     buffered: LintBuffer,
     warn_about_weird_lints: bool,
 ) -> LintBuffer {
     let mut cx = EarlyContextAndPass {
-        context: EarlyContext::new(sess, lint_store, krate, buffered, warn_about_weird_lints),
+        context: EarlyContext::new(
+            sess,
+            lint_store,
+            krate,
+            crate_attrs,
+            buffered,
+            warn_about_weird_lints,
+        ),
         pass,
     };
 
@@ -347,6 +363,7 @@ pub fn check_ast_crate<T: EarlyLintPass>(
     sess: &Session,
     lint_store: &LintStore,
     krate: &ast::Crate,
+    crate_attrs: &[ast::Attribute],
     pre_expansion: bool,
     lint_buffer: Option<LintBuffer>,
     builtin_lints: T,
@@ -357,14 +374,22 @@ pub fn check_ast_crate<T: EarlyLintPass>(
     let mut buffered = lint_buffer.unwrap_or_default();
 
     if !sess.opts.debugging_opts.no_interleave_lints {
-        buffered =
-            early_lint_crate(sess, lint_store, krate, builtin_lints, buffered, pre_expansion);
+        buffered = early_lint_crate(
+            sess,
+            lint_store,
+            krate,
+            crate_attrs,
+            builtin_lints,
+            buffered,
+            pre_expansion,
+        );
 
         if !passes.is_empty() {
             buffered = early_lint_crate(
                 sess,
                 lint_store,
                 krate,
+                crate_attrs,
                 EarlyLintPassObjects { lints: &mut passes[..] },
                 buffered,
                 false,
@@ -378,6 +403,7 @@ pub fn check_ast_crate<T: EarlyLintPass>(
                         sess,
                         lint_store,
                         krate,
+                        crate_attrs,
                         EarlyLintPassObjects { lints: slice::from_mut(pass) },
                         buffered,
                         pre_expansion && i == 0,
@@ -389,9 +415,15 @@ pub fn check_ast_crate<T: EarlyLintPass>(
     // All of the buffered lints should have been emitted at this point.
     // If not, that means that we somehow buffered a lint for a node id
     // that was not lint-checked (perhaps it doesn't exist?). This is a bug.
-    for (_id, lints) in buffered.map {
+    for (id, lints) in buffered.map {
         for early_lint in lints {
-            sess.delay_span_bug(early_lint.span, "failed to process buffered lint here");
+            sess.delay_span_bug(
+                early_lint.span,
+                &format!(
+                    "failed to process buffered lint here (dummy = {})",
+                    id == ast::DUMMY_NODE_ID
+                ),
+            );
         }
     }
 }

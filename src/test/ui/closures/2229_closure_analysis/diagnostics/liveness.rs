@@ -1,8 +1,9 @@
+// edition:2021
+
 // check-pass
-#![feature(capture_disjoint_fields)]
-//~^ WARNING: the feature `capture_disjoint_fields` is incomplete
 #![allow(unreachable_code)]
 #![warn(unused)]
+#![allow(dead_code)]
 
 #[derive(Debug)]
 struct Point {

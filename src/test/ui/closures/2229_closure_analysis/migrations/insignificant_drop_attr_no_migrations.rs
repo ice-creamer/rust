@@ -1,8 +1,9 @@
 // run-pass
 
-#![deny(disjoint_capture_migration)]
+#![deny(rust_2021_incompatible_closure_captures)]
 #![feature(rustc_attrs)]
 #![allow(unused)]
+#[rustc_insignificant_dtor]
 
 struct InsignificantDropPoint {
     x: i32,
@@ -10,7 +11,6 @@ struct InsignificantDropPoint {
 }
 
 impl Drop for InsignificantDropPoint {
-    #[rustc_insignificant_dtor]
     fn drop(&mut self) {}
 }
 

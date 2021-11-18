@@ -54,6 +54,50 @@ macro_rules! map_insert_seq_bench {
     };
 }
 
+macro_rules! map_from_iter_rand_bench {
+    ($name: ident, $n: expr, $map: ident) => {
+        #[bench]
+        pub fn $name(b: &mut Bencher) {
+            let n: usize = $n;
+            // setup
+            let mut rng = thread_rng();
+            let mut vec = Vec::with_capacity(n);
+
+            for _ in 0..n {
+                let i = rng.gen::<usize>() % n;
+                vec.push((i, i));
+            }
+
+            // measure
+            b.iter(|| {
+                let map: $map<_, _> = vec.iter().copied().collect();
+                black_box(map);
+            });
+        }
+    };
+}
+
+macro_rules! map_from_iter_seq_bench {
+    ($name: ident, $n: expr, $map: ident) => {
+        #[bench]
+        pub fn $name(b: &mut Bencher) {
+            let n: usize = $n;
+            // setup
+            let mut vec = Vec::with_capacity(n);
+
+            for i in 0..n {
+                vec.push((i, i));
+            }
+
+            // measure
+            b.iter(|| {
+                let map: $map<_, _> = vec.iter().copied().collect();
+                black_box(map);
+            });
+        }
+    };
+}
+
 macro_rules! map_find_rand_bench {
     ($name: ident, $n: expr, $map: ident) => {
         #[bench]
@@ -110,6 +154,12 @@ map_insert_rand_bench! {insert_rand_10_000, 10_000, BTreeMap}
 
 map_insert_seq_bench! {insert_seq_100,    100,    BTreeMap}
 map_insert_seq_bench! {insert_seq_10_000, 10_000, BTreeMap}
+
+map_from_iter_rand_bench! {from_iter_rand_100,    100,    BTreeMap}
+map_from_iter_rand_bench! {from_iter_rand_10_000, 10_000, BTreeMap}
+
+map_from_iter_seq_bench! {from_iter_seq_100,    100,    BTreeMap}
+map_from_iter_seq_bench! {from_iter_seq_10_000, 10_000, BTreeMap}
 
 map_find_rand_bench! {find_rand_100,    100,    BTreeMap}
 map_find_rand_bench! {find_rand_10_000, 10_000, BTreeMap}
@@ -177,7 +227,7 @@ pub fn iteration_mut_100000(b: &mut Bencher) {
     bench_iteration_mut(b, 100000);
 }
 
-fn bench_first_and_last(b: &mut Bencher, size: i32) {
+fn bench_first_and_last_nightly(b: &mut Bencher, size: i32) {
     let map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
     b.iter(|| {
         for _ in 0..10 {
@@ -187,19 +237,44 @@ fn bench_first_and_last(b: &mut Bencher, size: i32) {
     });
 }
 
-#[bench]
-pub fn first_and_last_0(b: &mut Bencher) {
-    bench_first_and_last(b, 0);
+fn bench_first_and_last_stable(b: &mut Bencher, size: i32) {
+    let map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
+    b.iter(|| {
+        for _ in 0..10 {
+            black_box(map.iter().next());
+            black_box(map.iter().next_back());
+        }
+    });
 }
 
 #[bench]
-pub fn first_and_last_100(b: &mut Bencher) {
-    bench_first_and_last(b, 100);
+pub fn first_and_last_0_nightly(b: &mut Bencher) {
+    bench_first_and_last_nightly(b, 0);
 }
 
 #[bench]
-pub fn first_and_last_10k(b: &mut Bencher) {
-    bench_first_and_last(b, 10_000);
+pub fn first_and_last_0_stable(b: &mut Bencher) {
+    bench_first_and_last_stable(b, 0);
+}
+
+#[bench]
+pub fn first_and_last_100_nightly(b: &mut Bencher) {
+    bench_first_and_last_nightly(b, 100);
+}
+
+#[bench]
+pub fn first_and_last_100_stable(b: &mut Bencher) {
+    bench_first_and_last_stable(b, 100);
+}
+
+#[bench]
+pub fn first_and_last_10k_nightly(b: &mut Bencher) {
+    bench_first_and_last_nightly(b, 10_000);
+}
+
+#[bench]
+pub fn first_and_last_10k_stable(b: &mut Bencher) {
+    bench_first_and_last_stable(b, 10_000);
 }
 
 const BENCH_RANGE_SIZE: i32 = 145;
@@ -215,7 +290,7 @@ where
         let mut c = 0;
         for i in 0..BENCH_RANGE_SIZE {
             for j in i + 1..BENCH_RANGE_SIZE {
-                black_box(map.range(f(i, j)));
+                let _ = black_box(map.range(f(i, j)));
                 c += 1;
             }
         }
@@ -247,7 +322,7 @@ fn bench_iter(b: &mut Bencher, repeats: i32, size: i32) {
     let map: BTreeMap<_, _> = (0..size).map(|i| (i, i)).collect();
     b.iter(|| {
         for _ in 0..repeats {
-            black_box(map.iter());
+            let _ = black_box(map.iter());
         }
     });
 }

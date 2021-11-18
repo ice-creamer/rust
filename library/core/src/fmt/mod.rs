@@ -4,16 +4,18 @@
 
 use crate::cell::{Cell, Ref, RefCell, RefMut, UnsafeCell};
 use crate::char::EscapeDebugExtArgs;
-use crate::iter;
 use crate::marker::PhantomData;
 use crate::mem;
-use crate::num::flt2dec;
+use crate::num::fmt as numfmt;
 use crate::ops::Deref;
 use crate::result;
 use crate::str;
 
 mod builders;
+#[cfg(not(no_fp_fmt_parse))]
 mod float;
+#[cfg(no_fp_fmt_parse)]
+mod nofloat;
 mod num;
 
 #[stable(feature = "fmt_flags_align", since = "1.28.0")]
@@ -263,6 +265,27 @@ pub struct ArgumentV1<'a> {
     formatter: fn(&Opaque, &mut Formatter<'_>) -> Result,
 }
 
+/// This struct represents the unsafety of constructing an `Arguments`.
+/// It exists, rather than an unsafe function, in order to simplify the expansion
+/// of `format_args!(..)` and reduce the scope of the `unsafe` block.
+#[allow(missing_debug_implementations)]
+#[doc(hidden)]
+#[unstable(feature = "fmt_internals", reason = "internal to format_args!", issue = "none")]
+pub struct UnsafeArg {
+    _private: (),
+}
+
+impl UnsafeArg {
+    /// See documentation where `UnsafeArg` is required to know when it is safe to
+    /// create and use `UnsafeArg`.
+    #[doc(hidden)]
+    #[unstable(feature = "fmt_internals", reason = "internal to format_args!", issue = "none")]
+    #[inline(always)]
+    pub unsafe fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 // This guarantees a single stable value for the function pointer associated with
 // indices/counts in the formatting infrastructure.
 //
@@ -334,23 +357,32 @@ impl<'a> Arguments<'a> {
     #[doc(hidden)]
     #[inline]
     #[unstable(feature = "fmt_internals", reason = "internal to format_args!", issue = "none")]
-    pub fn new_v1(pieces: &'a [&'static str], args: &'a [ArgumentV1<'a>]) -> Arguments<'a> {
+    #[rustc_const_unstable(feature = "const_fmt_arguments_new", issue = "none")]
+    pub const fn new_v1(pieces: &'a [&'static str], args: &'a [ArgumentV1<'a>]) -> Arguments<'a> {
+        if pieces.len() < args.len() || pieces.len() > args.len() + 1 {
+            panic!("invalid args");
+        }
         Arguments { pieces, fmt: None, args }
     }
 
     /// This function is used to specify nonstandard formatting parameters.
-    /// The `pieces` array must be at least as long as `fmt` to construct
-    /// a valid Arguments structure. Also, any `Count` within `fmt` that is
-    /// `CountIsParam` or `CountIsNextParam` has to point to an argument
-    /// created with `argumentusize`. However, failing to do so doesn't cause
-    /// unsafety, but will ignore invalid .
+    ///
+    /// An `UnsafeArg` is required because the following invariants must be held
+    /// in order for this function to be safe:
+    /// 1. The `pieces` slice must be at least as long as `fmt`.
+    /// 2. Every [`rt::v1::Argument::position`] value within `fmt` must be a
+    ///    valid index of `args`.
+    /// 3. Every [`Count::Param`] within `fmt` must contain a valid index of
+    ///    `args`.
     #[doc(hidden)]
     #[inline]
     #[unstable(feature = "fmt_internals", reason = "internal to format_args!", issue = "none")]
-    pub fn new_v1_formatted(
+    #[rustc_const_unstable(feature = "const_fmt_arguments_new", issue = "none")]
+    pub const fn new_v1_formatted(
         pieces: &'a [&'static str],
         args: &'a [ArgumentV1<'a>],
         fmt: &'a [rt::v1::Argument],
+        _unsafe_arg: UnsafeArg,
     ) -> Arguments<'a> {
         Arguments { pieces, fmt: Some(fmt), args }
     }
@@ -367,7 +399,7 @@ impl<'a> Arguments<'a> {
 
         if self.args.is_empty() {
             pieces_length
-        } else if self.pieces[0] == "" && pieces_length < 16 {
+        } else if !self.pieces.is_empty() && self.pieces[0].is_empty() && pieces_length < 16 {
             // If the format string starts with an argument,
             // don't preallocate anything, unless length
             // of pieces is significant.
@@ -444,8 +476,10 @@ impl<'a> Arguments<'a> {
     /// assert_eq!(format_args!("{}", 1).as_str(), None);
     /// ```
     #[stable(feature = "fmt_as_str", since = "1.52.0")]
+    #[rustc_const_unstable(feature = "const_arguments_as_str", issue = "none")]
+    #[must_use]
     #[inline]
-    pub fn as_str(&self) -> Option<&'static str> {
+    pub const fn as_str(&self) -> Option<&'static str> {
         match (self.pieces, self.args) {
             ([], []) => Some(""),
             ([s], []) => Some(s),
@@ -564,13 +598,14 @@ impl Display for Arguments<'_> {
     on(
         crate_local,
         label = "`{Self}` cannot be formatted using `{{:?}}`",
-        note = "add `#[derive(Debug)]` or manually implement `{Debug}`"
+        note = "add `#[derive(Debug)]` to `{Self}` or manually `impl {Debug} for {Self}`"
     ),
     message = "`{Self}` doesn't implement `{Debug}`",
     label = "`{Self}` cannot be formatted using `{{:?}}` because it doesn't implement `{Debug}`"
 )]
 #[doc(alias = "{:?}")]
-#[rustc_diagnostic_item = "debug_trait"]
+#[rustc_diagnostic_item = "Debug"]
+#[rustc_trivial_field_reads]
 pub trait Debug {
     /// Formats the value using the given formatter.
     ///
@@ -662,6 +697,7 @@ pub use macros::Debug;
     note = "in format strings you may be able to use `{{:?}}` (or {{:#?}} for pretty-print) instead"
 )]
 #[doc(alias = "{}")]
+#[rustc_diagnostic_item = "Display"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait Display {
     /// Formats the value using the given formatter.
@@ -954,7 +990,7 @@ pub trait UpperHex {
 /// assert_eq!(&l_ptr[..2], "0x");
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_diagnostic_item = "pointer_trait"]
+#[rustc_diagnostic_item = "Pointer"]
 pub trait Pointer {
     /// Formats the value using the given formatter.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -1103,7 +1139,10 @@ pub fn write(output: &mut dyn Write, args: Arguments<'_>) -> Result {
     match args.fmt {
         None => {
             // We can use default formatting parameters for all arguments.
-            for (arg, piece) in iter::zip(args.args, args.pieces) {
+            for (i, arg) in args.args.iter().enumerate() {
+                // SAFETY: args.args and args.pieces come from the same Arguments,
+                // which guarantees the indexes are always within bounds.
+                let piece = unsafe { args.pieces.get_unchecked(i) };
                 if !piece.is_empty() {
                     formatter.buf.write_str(*piece)?;
                 }
@@ -1114,13 +1153,16 @@ pub fn write(output: &mut dyn Write, args: Arguments<'_>) -> Result {
         Some(fmt) => {
             // Every spec has a corresponding argument that is preceded by
             // a string piece.
-            for (arg, piece) in iter::zip(fmt, args.pieces) {
+            for (i, arg) in fmt.iter().enumerate() {
+                // SAFETY: fmt and args.pieces come from the same Arguments,
+                // which guarantees the indexes are always within bounds.
+                let piece = unsafe { args.pieces.get_unchecked(i) };
                 if !piece.is_empty() {
                     formatter.buf.write_str(*piece)?;
                 }
                 // SAFETY: arg and args.args come from the same Arguments,
                 // which guarantees the indexes are always within bounds.
-                unsafe { run(&mut formatter, arg, &args.args) }?;
+                unsafe { run(&mut formatter, arg, args.args) }?;
                 idx += 1;
             }
         }
@@ -1170,7 +1212,7 @@ unsafe fn getcount(args: &[ArgumentV1<'_>], cnt: &rt::v1::Count) -> Option<usize
 
 /// Padding after the end of something. Returned by `Formatter::padding`.
 #[must_use = "don't forget to write the post padding"]
-struct PostPadding {
+pub(crate) struct PostPadding {
     fill: char,
     padding: usize,
 }
@@ -1181,9 +1223,9 @@ impl PostPadding {
     }
 
     /// Write this post padding.
-    fn write(self, buf: &mut dyn Write) -> Result {
+    pub(crate) fn write(self, f: &mut Formatter<'_>) -> Result {
         for _ in 0..self.padding {
-            buf.write_char(self.fill)?;
+            f.buf.write_char(self.fill)?;
         }
         Ok(())
     }
@@ -1306,7 +1348,7 @@ impl<'a> Formatter<'a> {
                 write_prefix(self, sign, prefix)?;
                 let post_padding = self.padding(min - width, rt::v1::Alignment::Right)?;
                 self.buf.write_str(buf)?;
-                post_padding.write(self.buf)?;
+                post_padding.write(self)?;
                 self.fill = old_fill;
                 self.align = old_align;
                 Ok(())
@@ -1316,7 +1358,7 @@ impl<'a> Formatter<'a> {
                 let post_padding = self.padding(min - width, rt::v1::Alignment::Right)?;
                 write_prefix(self, sign, prefix)?;
                 self.buf.write_str(buf)?;
-                post_padding.write(self.buf)
+                post_padding.write(self)
             }
         }
     }
@@ -1366,7 +1408,7 @@ impl<'a> Formatter<'a> {
                 // we know that it can't panic. Use `get` + `unwrap_or` to avoid
                 // `unsafe` and otherwise don't emit any panic-related code
                 // here.
-                s.get(..i).unwrap_or(&s)
+                s.get(..i).unwrap_or(s)
             } else {
                 &s
             }
@@ -1378,16 +1420,21 @@ impl<'a> Formatter<'a> {
             // If we're under the maximum length, and there's no minimum length
             // requirements, then we can just emit the string
             None => self.buf.write_str(s),
-            // If we're under the maximum width, check if we're over the minimum
-            // width, if so it's as easy as just emitting the string.
-            Some(width) if s.chars().count() >= width => self.buf.write_str(s),
-            // If we're under both the maximum and the minimum width, then fill
-            // up the minimum width with the specified string + some alignment.
             Some(width) => {
-                let align = rt::v1::Alignment::Left;
-                let post_padding = self.padding(width - s.chars().count(), align)?;
-                self.buf.write_str(s)?;
-                post_padding.write(self.buf)
+                let chars_count = s.chars().count();
+                // If we're under the maximum width, check if we're over the minimum
+                // width, if so it's as easy as just emitting the string.
+                if chars_count >= width {
+                    self.buf.write_str(s)
+                }
+                // If we're under both the maximum and the minimum width, then fill
+                // up the minimum width with the specified string + some alignment.
+                else {
+                    let align = rt::v1::Alignment::Left;
+                    let post_padding = self.padding(width - chars_count, align)?;
+                    self.buf.write_str(s)?;
+                    post_padding.write(self)
+                }
             }
         }
     }
@@ -1395,7 +1442,7 @@ impl<'a> Formatter<'a> {
     /// Write the pre-padding and return the unwritten post-padding. Callers are
     /// responsible for ensuring post-padding is written after the thing that is
     /// being padded.
-    fn padding(
+    pub(crate) fn padding(
         &mut self,
         padding: usize,
         default: rt::v1::Alignment,
@@ -1421,7 +1468,7 @@ impl<'a> Formatter<'a> {
     /// Takes the formatted parts and applies the padding.
     /// Assumes that the caller already has rendered the parts with required precision,
     /// so that `self.precision` can be ignored.
-    fn pad_formatted_parts(&mut self, formatted: &flt2dec::Formatted<'_>) -> Result {
+    fn pad_formatted_parts(&mut self, formatted: &numfmt::Formatted<'_>) -> Result {
         if let Some(mut width) = self.width {
             // for the sign-aware zero padding, we render the sign first and
             // behave as if we had no sign from the beginning.
@@ -1450,7 +1497,7 @@ impl<'a> Formatter<'a> {
             } else {
                 let post_padding = self.padding(width - len, align)?;
                 self.write_formatted_parts(&formatted)?;
-                post_padding.write(self.buf)
+                post_padding.write(self)
             };
             self.fill = old_fill;
             self.align = old_align;
@@ -1461,14 +1508,14 @@ impl<'a> Formatter<'a> {
         }
     }
 
-    fn write_formatted_parts(&mut self, formatted: &flt2dec::Formatted<'_>) -> Result {
+    fn write_formatted_parts(&mut self, formatted: &numfmt::Formatted<'_>) -> Result {
         fn write_bytes(buf: &mut dyn Write, s: &[u8]) -> Result {
-            // SAFETY: This is used for `flt2dec::Part::Num` and `flt2dec::Part::Copy`.
-            // It's safe to use for `flt2dec::Part::Num` since every char `c` is between
+            // SAFETY: This is used for `numfmt::Part::Num` and `numfmt::Part::Copy`.
+            // It's safe to use for `numfmt::Part::Num` since every char `c` is between
             // `b'0'` and `b'9'`, which means `s` is valid UTF-8.
-            // It's also probably safe in practice to use for `flt2dec::Part::Copy(buf)`
+            // It's also probably safe in practice to use for `numfmt::Part::Copy(buf)`
             // since `buf` should be plain ASCII, but it's possible for someone to pass
-            // in a bad value for `buf` into `flt2dec::to_shortest_str` since it is a
+            // in a bad value for `buf` into `numfmt::to_shortest_str` since it is a
             // public function.
             // FIXME: Determine whether this could result in UB.
             buf.write_str(unsafe { str::from_utf8_unchecked(s) })
@@ -1479,7 +1526,7 @@ impl<'a> Formatter<'a> {
         }
         for part in formatted.parts {
             match *part {
-                flt2dec::Part::Zero(mut nzeroes) => {
+                numfmt::Part::Zero(mut nzeroes) => {
                     const ZEROES: &str = // 64 zeroes
                         "0000000000000000000000000000000000000000000000000000000000000000";
                     while nzeroes > ZEROES.len() {
@@ -1490,7 +1537,7 @@ impl<'a> Formatter<'a> {
                         self.buf.write_str(&ZEROES[..nzeroes])?;
                     }
                 }
-                flt2dec::Part::Num(mut v) => {
+                numfmt::Part::Num(mut v) => {
                     let mut s = [0; 5];
                     let len = part.len();
                     for c in s[..len].iter_mut().rev() {
@@ -1499,7 +1546,7 @@ impl<'a> Formatter<'a> {
                     }
                     write_bytes(self.buf, &s[..len])?;
                 }
-                flt2dec::Part::Copy(buf) => {
+                numfmt::Part::Copy(buf) => {
                     write_bytes(self.buf, buf)?;
                 }
             }
@@ -1557,6 +1604,7 @@ impl<'a> Formatter<'a> {
     }
 
     /// Flags for formatting
+    #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_deprecated(
         since = "1.24.0",
@@ -1594,6 +1642,7 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(&format!("{:G>3}", Foo), "GGG");
     /// assert_eq!(&format!("{:t>6}", Foo), "tttttt");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags", since = "1.5.0")]
     pub fn fill(&self) -> char {
         self.fill
@@ -1630,6 +1679,7 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(&format!("{:^}", Foo), "center");
     /// assert_eq!(&format!("{}", Foo), "into the void");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags_align", since = "1.28.0")]
     pub fn align(&self) -> Option<Alignment> {
         match self.align {
@@ -1664,6 +1714,7 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(&format!("{:10}", Foo(23)), "Foo(23)   ");
     /// assert_eq!(&format!("{}", Foo(23)), "Foo(23)");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags", since = "1.5.0")]
     pub fn width(&self) -> Option<usize> {
         self.width
@@ -1694,6 +1745,7 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(&format!("{:.4}", Foo(23.2)), "Foo(23.2000)");
     /// assert_eq!(&format!("{}", Foo(23.2)), "Foo(23.20)");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags", since = "1.5.0")]
     pub fn precision(&self) -> Option<usize> {
         self.precision
@@ -1724,6 +1776,7 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(&format!("{:+}", Foo(23)), "Foo(+23)");
     /// assert_eq!(&format!("{}", Foo(23)), "Foo(23)");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags", since = "1.5.0")]
     pub fn sign_plus(&self) -> bool {
         self.flags & (1 << FlagV1::SignPlus as u32) != 0
@@ -1752,6 +1805,7 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(&format!("{:-}", Foo(23)), "-Foo(23)");
     /// assert_eq!(&format!("{}", Foo(23)), "Foo(23)");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags", since = "1.5.0")]
     pub fn sign_minus(&self) -> bool {
         self.flags & (1 << FlagV1::SignMinus as u32) != 0
@@ -1779,6 +1833,7 @@ impl<'a> Formatter<'a> {
     /// assert_eq!(&format!("{:#}", Foo(23)), "Foo(23)");
     /// assert_eq!(&format!("{}", Foo(23)), "23");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags", since = "1.5.0")]
     pub fn alternate(&self) -> bool {
         self.flags & (1 << FlagV1::Alternate as u32) != 0
@@ -1804,6 +1859,7 @@ impl<'a> Formatter<'a> {
     ///
     /// assert_eq!(&format!("{:04}", Foo(23)), "23");
     /// ```
+    #[must_use]
     #[stable(feature = "fmt_flags", since = "1.5.0")]
     pub fn sign_aware_zero_pad(&self) -> bool {
         self.flags & (1 << FlagV1::SignAwareZeroPad as u32) != 0

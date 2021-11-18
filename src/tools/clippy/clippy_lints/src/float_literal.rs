@@ -10,15 +10,14 @@ use rustc_session::{declare_lint_pass, declare_tool_lint};
 use std::fmt;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for float literals with a precision greater
+    /// ### What it does
+    /// Checks for float literals with a precision greater
     /// than that supported by the underlying type.
     ///
-    /// **Why is this bad?** Rust will truncate the literal silently.
+    /// ### Why is this bad?
+    /// Rust will truncate the literal silently.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// ```rust
     /// // Bad
     /// let v: f32 = 0.123_456_789_9;
@@ -34,16 +33,15 @@ declare_clippy_lint! {
 }
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for whole number float literals that
+    /// ### What it does
+    /// Checks for whole number float literals that
     /// cannot be represented as the underlying type without loss.
     ///
-    /// **Why is this bad?** Rust will silently lose precision during
+    /// ### Why is this bad?
+    /// Rust will silently lose precision during
     /// conversion to a float.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// ```rust
     /// // Bad
     /// let _: f32 = 16_777_217.0; // 16_777_216.0
@@ -113,7 +111,7 @@ impl<'tcx> LateLintPass<'tcx> for FloatLiteral {
                             Applicability::MachineApplicable,
                         );
                     }
-                } else if digits > max as usize && sym_str != float_str {
+                } else if digits > max as usize && float_str.len() < sym_str.len() {
                     span_lint_and_sugg(
                         cx,
                         EXCESSIVE_PRECISION,
